@@ -1,0 +1,183 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	exchanges "github.com/QuantProcessing/exchanges"
+	"github.com/QuantProcessing/exchanges/edgex"
+	"github.com/QuantProcessing/exchanges/lighter"
+	"github.com/QuantProcessing/notify/telegram"
+	"github.com/joho/godotenv"
+	"go.uber.org/zap"
+)
+
+func main() {
+	// Load .env file (ignore error if not present)
+	godotenv.Load()
+
+	// Parse config
+	cfg := ParseConfig()
+
+	// Create logger
+	zapCfg := zap.NewDevelopmentConfig()
+	zapCfg.DisableStacktrace = true
+	zapLogger, err := zapCfg.Build()
+	if err != nil {
+		panic(err)
+	}
+	defer zapLogger.Sync()
+	logger := zapLogger.Sugar()
+
+	// Initialize Telegram notifications (optional)
+	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
+		if err := telegram.Init(telegram.Config{
+			BotToken: token,
+			ChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
+		}); err != nil {
+			logger.Warnw("telegram init failed", "err", err)
+		} else {
+			logger.Infow("telegram notifications enabled")
+		}
+	}
+
+	// Print startup banner
+	fmt.Println(cfg.String())
+
+	// Create context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		logger.Infow("received signal, shutting down...", "signal", sig)
+		cancel()
+	}()
+
+	// Create adapters directly
+	logger.Infow("creating adapters...")
+	maker, err := createAdapter(ctx, cfg.MakerExchange, logger)
+	if err != nil {
+		logger.Fatalw("failed to create maker adapter", "exchange", cfg.MakerExchange, "err", err)
+	}
+	defer maker.Close()
+
+	taker, err := createAdapter(ctx, cfg.TakerExchange, logger)
+	if err != nil {
+		logger.Fatalw("failed to create taker adapter", "exchange", cfg.TakerExchange, "err", err)
+	}
+	defer taker.Close()
+
+	// Print exchange info
+	printExchangeInfo(ctx, maker, cfg.Symbol, cfg.MakerExchange, logger)
+	printExchangeInfo(ctx, taker, cfg.Symbol, cfg.TakerExchange, logger)
+	fmt.Println("════════════════════════════════════════════════════════")
+
+	// Load fee rates
+	makerFee := loadFeeRate(ctx, maker, cfg.Symbol, cfg.MakerExchange, logger)
+	takerFee := loadFeeRate(ctx, taker, cfg.Symbol, cfg.TakerExchange, logger)
+
+	// Create spread engine
+	engine := NewSpreadEngine(maker, taker, cfg, logger)
+	engine.SetFees(makerFee, takerFee)
+	defer engine.Close()
+
+	if cfg.ObserveOnly {
+		logger.Infow("🔍 OBSERVE-ONLY MODE: collecting spread data to CSV. Press Ctrl+C to stop.")
+		if err := engine.Start(ctx); err != nil && ctx.Err() == nil {
+			logger.Errorw("spread engine error", "err", err)
+		}
+		return
+	}
+
+	// Create trader
+	trader := NewTrader(maker, taker, engine, cfg, logger)
+
+	// Connect signal callback
+	engine.SetSignalCallback(func(sig *SpreadSignal) {
+		trader.HandleSignal(sig)
+	})
+
+	// Start trader monitoring
+	trader.Start(ctx)
+
+	mode := "LIVE"
+	if cfg.DryRun {
+		mode = "DRY RUN"
+	}
+	logger.Infow("🚀 Starting spread monitoring...", "mode", mode)
+
+	// Start spread engine (blocks until context done or error)
+	if err := engine.Start(ctx); err != nil && ctx.Err() == nil {
+		logger.Errorw("spread engine error", "err", err)
+	}
+
+	logger.Infow("shutdown complete")
+}
+
+// createAdapter creates an exchange adapter using direct construction.
+func createAdapter(ctx context.Context, name string, logger *zap.SugaredLogger) (exchanges.Exchange, error) {
+	switch strings.ToUpper(name) {
+	case "EDGEX":
+		return edgex.NewAdapter(ctx, edgex.Options{
+			PrivateKey: os.Getenv("EXCHANGES_EDGEX_PRIVATE_KEY"),
+			AccountID:  os.Getenv("EXCHANGES_EDGEX_ACCOUNT_ID"),
+			Logger:     logger,
+		})
+	case "LIGHTER":
+		return lighter.NewAdapter(ctx, lighter.Options{
+			PrivateKey:   os.Getenv("EXCHANGES_LIGHTER_PRIVATE_KEY"),
+			AccountIndex: os.Getenv("EXCHANGES_LIGHTER_ACCOUNT_INDEX"),
+			KeyIndex:     os.Getenv("EXCHANGES_LIGHTER_KEY_INDEX"),
+			RoToken:      os.Getenv("EXCHANGES_LIGHTER_RO_TOKEN"),
+			Logger:       logger,
+		})
+	default:
+		return nil, fmt.Errorf("unsupported exchange %q: supported exchanges are EDGEX, LIGHTER", name)
+	}
+}
+
+// printExchangeInfo prints exchange price and symbol details at startup.
+func printExchangeInfo(ctx context.Context, adp exchanges.Exchange, symbol, name string, logger *zap.SugaredLogger) {
+	ticker, err := adp.FetchTicker(ctx, symbol)
+	if err != nil {
+		logger.Warnw("failed to fetch ticker", "exchange", name, "err", err)
+		return
+	}
+
+	details, err := adp.FetchSymbolDetails(ctx, symbol)
+	if err != nil {
+		logger.Warnw("failed to fetch symbol details", "exchange", name, "err", err)
+		fmt.Printf("  %-10s %s Price: %s\n", name, symbol, ticker.LastPrice)
+		return
+	}
+
+	fmt.Printf("  %-10s %s Price: %s  (PricePrecision=%d, QtyPrecision=%d, MinQty=%s)\n",
+		name, symbol, ticker.LastPrice,
+		details.PricePrecision, details.QuantityPrecision, details.MinQuantity)
+}
+
+// loadFeeRate fetches fee rates for an exchange.
+func loadFeeRate(ctx context.Context, adp exchanges.Exchange, symbol, name string, logger *zap.SugaredLogger) FeeInfo {
+	fee, err := adp.FetchFeeRate(ctx, symbol)
+	if err != nil {
+		logger.Warnw("failed to fetch fee rate, using defaults",
+			"exchange", name, "err", err)
+		return FeeInfo{MakerRate: 0.0002, TakerRate: 0.0005} // conservative defaults
+	}
+
+	makerRate, _ := fee.Maker.Float64()
+	takerRate, _ := fee.Taker.Float64()
+
+	fmt.Printf("  %-10s Fees: Maker=%.4f%% Taker=%.4f%%\n",
+		name, makerRate*100, takerRate*100)
+
+	return FeeInfo{MakerRate: makerRate, TakerRate: takerRate}
+}

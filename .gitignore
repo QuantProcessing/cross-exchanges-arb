@@ -1,0 +1,24 @@
+# Binaries
+cross-exchanges-arb
+cross-arb
+*.exe
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Data output
+*.csv
+
+# Agent skills
+.agent/
+
+# Data files
+spread_*.csv
