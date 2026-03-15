@@ -169,6 +169,20 @@ Where μ and σ are computed over a rolling window of recent ticks. The model as
 
 **Fee-aware filtering**: Signals are only emitted when `expectedProfit > roundTripFees + minProfitBps`, where round-trip fees account for maker fees on the maker exchange and taker fees on the taker exchange (×2 for open + close).
 
+## Limitations
+
+> ⚠️ **This is an MVP (Minimum Viable Product) for algorithm validation.** It is a working prototype, not production-grade software.
+
+The following are **not** handled in the current version:
+
+- **Rate limiting** — No throttling of API requests; rapid signals may trigger exchange rate limits causing order rejections
+- **Retry logic** — Failed orders are not retried
+- **One-leg risk** — If one side of a trade fails, the other side is not automatically unwound
+- **Partial fills** — Not fully handled in close logic
+- **Multi-position** — Only one position at a time
+- **Dynamic fee refresh** — Fees are fetched once at startup
+- **Reconnection** — WebSocket disconnects are not gracefully recovered
+
 ## License
 
 MIT
