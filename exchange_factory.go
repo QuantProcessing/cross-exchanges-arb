@@ -10,10 +10,9 @@ import (
 )
 
 type ExchangeRuntimeConfig struct {
-	Name          string
-	MarketType    exchanges.MarketType
-	QuoteCurrency string
-	Options       map[string]string
+	Name       string
+	MarketType exchanges.MarketType
+	Options    map[string]string
 }
 
 func BuildExchangeConfigs(cfg *Config) (ExchangeRuntimeConfig, ExchangeRuntimeConfig) {
@@ -56,27 +55,65 @@ func NewExchangePair(ctx context.Context, cfg *Config) (exchanges.Exchange, exch
 func buildExchangeRuntimeConfig(name string) ExchangeRuntimeConfig {
 	normalized := strings.ToUpper(strings.TrimSpace(name))
 	rc := ExchangeRuntimeConfig{
-		Name:          normalized,
-		MarketType:    exchanges.MarketTypePerp,
-		QuoteCurrency: string(exchanges.QuoteCurrencyUSDC),
+		Name:       normalized,
+		MarketType: exchanges.MarketTypePerp,
 		Options: map[string]string{
 			"quote_currency": string(exchanges.QuoteCurrencyUSDC),
 		},
 	}
 
 	switch normalized {
+	case "EDGEX":
+		rc.Options["private_key"] = envFirst(
+			"EXCHANGES_EDGEX_PRIVATE_KEY",
+			"EDGEX_PRIVATE_KEY",
+		)
+		rc.Options["account_id"] = envFirst(
+			"EXCHANGES_EDGEX_ACCOUNT_ID",
+			"EDGEX_ACCOUNT_ID",
+		)
 	case "DECIBEL":
-		rc.Options["api_key"] = os.Getenv("DECIBEL_API_KEY")
-		rc.Options["private_key"] = os.Getenv("DECIBEL_PRIVATE_KEY")
-		rc.Options["subaccount_addr"] = os.Getenv("DECIBEL_SUBACCOUNT_ADDR")
+		rc.Options["api_key"] = envFirst(
+			"DECIBEL_API_KEY",
+			"EXCHANGES_DECIBEL_API_KEY",
+		)
+		rc.Options["private_key"] = envFirst(
+			"DECIBEL_PRIVATE_KEY",
+			"EXCHANGES_DECIBEL_PRIVATE_KEY",
+		)
+		rc.Options["subaccount_addr"] = envFirst(
+			"DECIBEL_SUBACCOUNT_ADDR",
+			"EXCHANGES_DECIBEL_SUBACCOUNT_ADDR",
+		)
 	case "LIGHTER":
-		rc.Options["private_key"] = os.Getenv("LIGHTER_PRIVATE_KEY")
-		rc.Options["account_index"] = os.Getenv("LIGHTER_ACCOUNT_INDEX")
-		rc.Options["key_index"] = os.Getenv("LIGHTER_KEY_INDEX")
-		rc.Options["ro_token"] = os.Getenv("LIGHTER_RO_TOKEN")
+		rc.Options["private_key"] = envFirst(
+			"EXCHANGES_LIGHTER_PRIVATE_KEY",
+			"LIGHTER_PRIVATE_KEY",
+		)
+		rc.Options["account_index"] = envFirst(
+			"EXCHANGES_LIGHTER_ACCOUNT_INDEX",
+			"LIGHTER_ACCOUNT_INDEX",
+		)
+		rc.Options["key_index"] = envFirst(
+			"EXCHANGES_LIGHTER_KEY_INDEX",
+			"LIGHTER_KEY_INDEX",
+		)
+		rc.Options["ro_token"] = envFirst(
+			"EXCHANGES_LIGHTER_RO_TOKEN",
+			"LIGHTER_RO_TOKEN",
+		)
 	default:
 		rc.Options = map[string]string{}
 	}
 
 	return rc
+}
+
+func envFirst(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return ""
 }

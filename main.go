@@ -9,6 +9,7 @@ import (
 
 	exchanges "github.com/QuantProcessing/exchanges"
 	_ "github.com/QuantProcessing/exchanges/decibel"
+	_ "github.com/QuantProcessing/exchanges/edgex"
 	_ "github.com/QuantProcessing/exchanges/lighter"
 	"github.com/QuantProcessing/notify/telegram"
 	"github.com/joho/godotenv"
