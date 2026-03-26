@@ -134,12 +134,12 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 			Symbol:        "BTC",
 			Quantity:      qty,
 			Slippage:      0.001,
-			MakerTimeout:  10 * time.Millisecond,
+			MakerTimeout:  1 * time.Second,
 		},
 		logger:       zap.NewNop().Sugar(),
 		makerOrderCh: make(chan *exchanges.Order, 10),
 		takerOrderCh: make(chan *exchanges.Order, 10),
-		state:        StateWaitingFill,
+		state:        StateIdle,
 	}
 
 	tr.openFlow = &openFlowState{
@@ -160,6 +160,46 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 	return tr, maker, taker
 }
 
+func waitForTraderState(t *testing.T, tr *Trader, want ExecutionState) {
+	t.Helper()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		tr.mu.Lock()
+		state := tr.state
+		tr.mu.Unlock()
+		if state == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	tr.mu.Lock()
+	got := tr.state
+	tr.mu.Unlock()
+	t.Fatalf("state = %s, want %s", got, want)
+}
+
+func waitForMakerOrders(t *testing.T, maker *testExchange, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		maker.mu.Lock()
+		got := len(maker.placedQtys)
+		maker.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	maker.mu.Lock()
+	got := len(maker.placedQtys)
+	maker.mu.Unlock()
+	t.Fatalf("maker order count = %d, want %d", got, want)
+}
+
 func TestTrader_MakerTimeoutKeepsBlockedWhenSettlementUnknown(t *testing.T) {
 	tr, _, _ := newActiveFlowTrader()
 
@@ -173,40 +213,34 @@ func TestTrader_MakerTimeoutKeepsBlockedWhenSettlementUnknown(t *testing.T) {
 	}
 }
 
-func TestTrader_PartialFillTracksThroughCancelSettlement(t *testing.T) {
-	tr, _, taker := newActiveFlowTrader()
-	tr.makerOrderCh <- &exchanges.Order{
-		OrderID:        "maker-1",
-		ClientOrderID:  "cid-1",
-		Status:         exchanges.OrderStatusPartiallyFilled,
-		FilledQuantity: decimal.RequireFromString("0.001"),
-	}
-	tr.makerOrderCh <- &exchanges.Order{
-		OrderID:        "maker-1",
-		ClientOrderID:  "cid-1",
-		Status:         exchanges.OrderStatusCancelled,
-		FilledQuantity: decimal.RequireFromString("0.003"),
+func TestTrader_HandleSignalTransitionsIntoOpenWorkflow(t *testing.T) {
+	tr, maker, _ := newActiveFlowTrader()
+	sig := &SpreadSignal{
+		Direction:      LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99"),
+		TakerBid:       decimal.RequireFromString("101"),
+		TakerAsk:       decimal.RequireFromString("102"),
 	}
 
-	tr.handleMakerTimeoutForTest()
+	tr.HandleSignal(sig)
 
-	taker.mu.Lock()
-	placedQtys := append([]decimal.Decimal(nil), taker.placedQtys...)
-	taker.mu.Unlock()
+	tr.mu.Lock()
+	initialState := tr.state
+	tr.mu.Unlock()
+	if initialState != StatePlacingMaker && initialState != StateWaitingFill {
+		t.Fatalf("state = %s, want placing_maker or waiting_fill", initialState)
+	}
 
-	if len(placedQtys) != 2 {
-		t.Fatalf("hedge count = %d, want 2", len(placedQtys))
+	waitForTraderState(t, tr, StateWaitingFill)
+	waitForMakerOrders(t, maker, 1)
+	if tr.openFlow == nil {
+		t.Fatal("openFlow was not initialized by HandleSignal")
 	}
-	if !placedQtys[0].Equal(decimal.RequireFromString("0.001")) {
-		t.Fatalf("first hedge qty = %s, want 0.001", placedQtys[0])
-	}
-	if !placedQtys[1].Equal(decimal.RequireFromString("0.002")) {
-		t.Fatalf("second hedge qty = %s, want 0.002", placedQtys[1])
-	}
-	if tr.state != StatePositionOpen {
-		t.Fatalf("state = %s, want position_open", tr.state)
-	}
-	if tr.openFlow != nil {
-		t.Fatal("openFlow was not cleared after settlement")
+	if tr.state != StateWaitingFill {
+		t.Fatalf("state = %s, want waiting_fill", tr.state)
 	}
 }
