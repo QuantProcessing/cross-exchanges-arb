@@ -41,6 +41,7 @@ type Trader struct {
 	mu              sync.Mutex
 	position        *ArbPosition // nil = no open position
 	lastTrade       time.Time    // for cooldown enforcement
+	lastSignalTime  time.Time    // for signal acceptance cooldown
 	lastLogTime     time.Time    // for stable position log interval
 	state           ExecutionState
 	completedRounds int
@@ -110,11 +111,19 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 		return
 	}
 
+	now := time.Now()
 	t.mu.Lock()
-	if !t.canStartNextRoundLocked(time.Now()) {
+	if !t.canStartNextRoundLocked(now) {
 		t.mu.Unlock()
 		return
 	}
+
+	// Prevent rapid-fire signals after PostOnly rejections.
+	if !t.lastSignalTime.IsZero() && now.Sub(t.lastSignalTime) < 3*time.Second {
+		t.mu.Unlock()
+		return
+	}
+	t.lastSignalTime = now
 
 	t.logger.Infow("🟢 SIGNAL detected",
 		"direction", sig.Direction,
@@ -134,10 +143,10 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 			Direction:    sig.Direction,
 			OpenSpread:   sig.SpreadBps,
 			OpenZScore:   sig.ZScore,
-			OpenTime:     time.Now(),
+			OpenTime:     now,
 			OpenQuantity: t.config.Quantity,
 		}
-		t.lastTrade = time.Now()
+		t.lastTrade = now
 		t.state = StatePositionOpen
 		t.mu.Unlock()
 		return
@@ -657,7 +666,7 @@ func (t *Trader) closePosition(reason string) {
 	if closeCtx == nil {
 		closeCtx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(closeCtx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(closeCtx, 30*time.Second)
 	defer cancel()
 
 	qty := t.config.Quantity
@@ -713,6 +722,38 @@ func (t *Trader) closePosition(reason string) {
 		}
 		t.logger.Errorw("❌ close leg failed", "leg", res.leg, "err", res.err)
 		failures = append(failures, fmt.Sprintf("%s leg: %v", res.leg, res.err))
+	}
+
+	// Retry failed legs once before going to ManualIntervention.
+	if len(failures) > 0 {
+		failures = nil // reset for retry
+		t.logger.Infow("🔄 retrying failed close legs...", "results", results)
+		retryCtx, retryCancel := context.WithTimeout(closeCtx, 15*time.Second)
+		defer retryCancel()
+
+		for _, leg := range []string{"long", "short"} {
+			res := results[leg]
+			if res.err == nil {
+				continue
+			}
+			var exchange exchanges.Exchange
+			var side exchanges.OrderSide
+			if leg == "long" {
+				exchange, side = longExchange, exchanges.OrderSideSell
+			} else {
+				exchange, side = shortExchange, exchanges.OrderSideBuy
+			}
+			retryOrder, retryErr := exchanges.PlaceMarketOrderWithSlippage(
+				retryCtx, exchange, t.config.Symbol, side, qty, slippage,
+			)
+			if retryErr != nil {
+				t.logger.Errorw("❌ close leg retry failed", "leg", leg, "err", retryErr)
+				failures = append(failures, fmt.Sprintf("%s leg (retry): %v", leg, retryErr))
+			} else {
+				t.logger.Infow("✅ close leg retry succeeded", "leg", leg, "orderID", retryOrder.OrderID)
+				results[leg] = closeLegResult{leg: leg, order: retryOrder}
+			}
+		}
 	}
 
 	if len(failures) > 0 {
