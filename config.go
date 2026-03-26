@@ -34,7 +34,7 @@ type Config struct {
 	MaxHoldTime  time.Duration // max position hold time before force close (default: 30m)
 	Slippage     float64       // slippage tolerance for market orders (default: 0.002 = 0.2%)
 	MakerTimeout time.Duration // maker order timeout before cancel/reset
-	MaxRounds    int           // max completed rounds in validation mode
+	MaxRounds    int           // max completed rounds in live validation mode
 	LiveValidate bool          // live validation mode toggle
 
 	// Run modes

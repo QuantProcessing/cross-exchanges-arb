@@ -293,6 +293,50 @@ func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
 	}
 }
 
+func TestTrader_SuccessfulCloseTransitionsToCooldown(t *testing.T) {
+	tr := newTestTraderWithPosition()
+
+	tr.closePosition("done")
+
+	if tr.state != StateCooldown {
+		t.Fatalf("state = %s, want cooldown", tr.state)
+	}
+	if tr.completedRounds != 1 {
+		t.Fatalf("completedRounds = %d, want 1", tr.completedRounds)
+	}
+}
+
+func TestTrader_MaxRoundsStopsNewTrading(t *testing.T) {
+	tr := newTestTrader()
+	tr.completedRounds = 1
+	tr.config.LiveValidate = true
+	tr.config.MaxRounds = 1
+
+	if tr.canStartNextRound() {
+		t.Fatal("expected trading to stop after max rounds")
+	}
+}
+
+func TestTrader_CooldownExpiryReturnsToIdle(t *testing.T) {
+	tr := newTestTraderWithPosition()
+	tr.config.Cooldown = 100 * time.Millisecond
+
+	tr.closePosition("done")
+
+	tr.mu.Lock()
+	tr.lastTrade = time.Now().Add(-tr.config.Cooldown - time.Millisecond)
+	tr.state = StateCooldown
+	tr.mu.Unlock()
+
+	if !tr.canStartNextRound() {
+		t.Fatal("expected trading to resume after cooldown expires")
+	}
+
+	if tr.state != StateIdle {
+		t.Fatalf("state = %s, want idle", tr.state)
+	}
+}
+
 func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	tr.config.MakerTimeout = 50 * time.Millisecond

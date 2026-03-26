@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	exchanges "github.com/QuantProcessing/exchanges"
@@ -38,11 +38,12 @@ type Trader struct {
 	config *Config
 	logger *zap.SugaredLogger
 
-	mu        sync.Mutex
-	position  *ArbPosition // nil = no open position
-	lastTrade time.Time    // for cooldown enforcement
-	state     ExecutionState
-	openFlow  *openFlowState
+	mu              sync.Mutex
+	position        *ArbPosition // nil = no open position
+	lastTrade       time.Time    // for cooldown enforcement
+	state           ExecutionState
+	completedRounds int
+	openFlow        *openFlowState
 
 	// For maker-taker mode: order update channel
 	makerOrderCh chan *exchanges.Order
@@ -102,19 +103,7 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 	}
 
 	t.mu.Lock()
-	if !IsExecutableSignal(t.state, DefaultExecutionProfile(), sig) {
-		t.mu.Unlock()
-		return
-	}
-
-	// Already have open position? Check if close signal.
-	if t.position != nil {
-		t.mu.Unlock()
-		return // close is handled by monitorLoop
-	}
-
-	// Cooldown check
-	if time.Since(t.lastTrade) < t.config.Cooldown {
+	if !t.canStartNextRoundLocked(time.Now()) {
 		t.mu.Unlock()
 		return
 	}
@@ -512,8 +501,15 @@ func (t *Trader) monitorLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			t.checkCloseConditions()
+			t.checkLoopControls()
 		}
 	}
+}
+
+func (t *Trader) checkLoopControls() {
+	t.mu.Lock()
+	t.releaseCooldownIfExpiredLocked(time.Now())
+	t.mu.Unlock()
 }
 
 // checkCloseConditions evaluates whether to close the current position.
@@ -594,10 +590,7 @@ func (t *Trader) closePosition(reason string) {
 			"direction", pos.Direction,
 			"openSpread", fmt.Sprintf("%.2f bps", pos.OpenSpread),
 		)
-		t.mu.Lock()
-		t.position = nil
-		t.state = StateIdle
-		t.mu.Unlock()
+		t.finishSuccessfulClose()
 		return
 	}
 
@@ -621,9 +614,9 @@ func (t *Trader) closePosition(reason string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	type closeLegResult struct {
-		leg string
+		leg   string
 		order *exchanges.Order
-		err error
+		err   error
 	}
 	errCh := make(chan closeLegResult, 2)
 
@@ -690,14 +683,46 @@ func (t *Trader) closePosition(reason string) {
 		return
 	}
 
-	t.mu.Lock()
-	t.position = nil
-	t.state = StateIdle
-	t.mu.Unlock()
+	t.finishSuccessfulClose()
 
 	t.logger.Infow("✅ Position closed", "reason", reason)
 	go telegram.Notify(fmt.Sprintf("🔴 Position closed\nReason: %s\nHeld: %s",
 		reason, time.Since(pos.OpenTime).Round(time.Second)))
+}
+
+func (t *Trader) finishSuccessfulClose() {
+	t.mu.Lock()
+	t.position = nil
+	t.state = StateCooldown
+	t.lastTrade = time.Now()
+	t.completedRounds++
+	t.mu.Unlock()
+}
+
+func (t *Trader) releaseCooldownIfExpiredLocked(now time.Time) {
+	if t.state != StateCooldown {
+		return
+	}
+	if t.config == nil || t.config.Cooldown <= 0 || now.Sub(t.lastTrade) >= t.config.Cooldown {
+		t.state = StateIdle
+	}
+}
+
+func (t *Trader) canStartNextRound() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.canStartNextRoundLocked(time.Now())
+}
+
+func (t *Trader) canStartNextRoundLocked(now time.Time) bool {
+	t.releaseCooldownIfExpiredLocked(now)
+	if t.state != StateIdle {
+		return false
+	}
+	if t.config != nil && t.config.LiveValidate && t.completedRounds >= t.config.MaxRounds {
+		return false
+	}
+	return true
 }
 
 // HasPosition returns whether the trader has an open position.
