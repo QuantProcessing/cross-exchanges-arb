@@ -18,6 +18,16 @@ func CanAcceptSignal(state ExecutionState) bool {
 	return state == StateIdle
 }
 
+// IsOpenFlowState reports whether the trader is inside the maker-open workflow.
+func IsOpenFlowState(state ExecutionState) bool {
+	switch state {
+	case StatePlacingMaker, StateWaitingFill, StateHedging:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsTerminalRoundBlocker reports whether the state represents an in-flight, unresolved,
 // or order-placement round that must block the next round until the round is cleared.
 func IsTerminalRoundBlocker(state ExecutionState) bool {
