@@ -55,13 +55,13 @@ func (p *PnLTracker) refreshBalances(ctx context.Context) {
 	if bal, err := p.maker.FetchBalance(fetchCtx); err == nil {
 		p.currentMakerBal = bal
 	} else {
-		p.logger.Warnw("failed to fetch maker balance", "exchange", p.makerName, "err", err)
+		p.logger.Warnf("balance fetch failed %s: %v", p.makerName, err)
 	}
 
 	if bal, err := p.taker.FetchBalance(fetchCtx); err == nil {
 		p.currentTakerBal = bal
 	} else {
-		p.logger.Warnw("failed to fetch taker balance", "exchange", p.takerName, "err", err)
+		p.logger.Warnf("balance fetch failed %s: %v", p.takerName, err)
 	}
 
 	p.lastRefresh = time.Now()
@@ -76,12 +76,8 @@ func (p *PnLTracker) OnRoundComplete(ctx context.Context) {
 	takerPnL := p.currentTakerBal.Sub(p.startTakerBal)
 	totalPnL := makerPnL.Add(takerPnL)
 
-	p.logger.Infow("💰 round complete — PnL update",
-		"round", p.rounds,
-		p.makerName, fmt.Sprintf("%s (PnL: %s)", p.currentMakerBal, makerPnL),
-		p.takerName, fmt.Sprintf("%s (PnL: %s)", p.currentTakerBal, takerPnL),
-		"totalPnL", totalPnL,
-	)
+	p.logger.Infof("💰 R%03d pnl  %s=%s(%+s) %s=%s(%+s) total=%s",
+		p.rounds, p.makerName, p.currentMakerBal, makerPnL, p.takerName, p.currentTakerBal, takerPnL, totalPnL)
 
 	go telegram.Notify(fmt.Sprintf("💰 Round %d Complete\n%s: %s (PnL: %s)\n%s: %s (PnL: %s)\nTotal PnL: %s",
 		p.rounds,
@@ -101,12 +97,8 @@ func (p *PnLTracker) PeriodicRefresh(ctx context.Context) {
 	takerPnL := p.currentTakerBal.Sub(p.startTakerBal)
 	totalPnL := makerPnL.Add(takerPnL)
 
-	p.logger.Infow("📊 balance check",
-		p.makerName, p.currentMakerBal,
-		p.takerName, p.currentTakerBal,
-		"totalPnL", totalPnL,
-		"rounds", p.rounds,
-	)
+	p.logger.Infof("📊 balance  %s=%s %s=%s pnl=%s rounds=%d",
+		p.makerName, p.currentMakerBal, p.takerName, p.currentTakerBal, totalPnL, p.rounds)
 }
 
 // StartupSummary returns a formatted summary for the startup Telegram notification.

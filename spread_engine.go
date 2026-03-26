@@ -174,8 +174,9 @@ type SpreadEngine struct {
 	statsBA *SpreadStats // spread: makerBid - takerAsk (Long Taker, Short Maker)
 
 	// Warmup tracking
-	firstSeen time.Time
-	tickCount int
+	firstSeen    time.Time
+	tickCount    int
+	warmupLogged int // bitmask: 1=25%, 2=50%, 4=75%, 8=100%, 16=complete
 
 	// Fee rates (loaded at startup)
 	makerFee FeeInfo
@@ -383,20 +384,11 @@ func (e *SpreadEngine) onBBOUpdate() {
 	}
 
 	// Log periodic status
-	if tickCount%50 == 0 {
-		if !warmedUp {
-			e.logger.Infow("warming up",
-				"ticks", fmt.Sprintf("%d/%d", tickCount, e.config.WarmupTicks),
-				"elapsed", now.Sub(e.firstSeen).Round(time.Second),
-			)
-		} else {
-			e.logger.Infow("spread status",
-				"AB", fmt.Sprintf("%.2f bps (Z=%.2f)", spreadAB, zAB),
-				"BA", fmt.Sprintf("%.2f bps (Z=%.2f)", spreadBA, zBA),
-				"μ_AB", fmt.Sprintf("%.2f", meanAB),
-				"σ_AB", fmt.Sprintf("%.2f", stddevAB),
-			)
-		}
+	if !warmedUp {
+		e.logWarmupMilestone(tickCount, now)
+	} else if tickCount%200 == 0 {
+		e.logger.Infof("📈 AB=%.1fbps(Z=%.2f) BA=%.1fbps(Z=%.2f) μ=%.2f σ=%.2f",
+			spreadAB, zAB, spreadBA, zBA, meanAB, stddevAB)
 	}
 
 	// No signals before warmup or in observe-only mode
@@ -494,4 +486,32 @@ func (e *SpreadEngine) IsWarmedUp() bool {
 	defer e.mu.Unlock()
 	return e.tickCount >= e.config.WarmupTicks &&
 		time.Since(e.firstSeen) >= e.config.WarmupDuration
+}
+
+// logWarmupMilestone logs warmup progress at 25/50/75/100% milestones. Must be called under e.mu.
+func (e *SpreadEngine) logWarmupMilestone(tickCount int, now time.Time) {
+	elapsed := now.Sub(e.firstSeen).Round(time.Second)
+	target := e.config.WarmupTicks
+	durationMet := elapsed >= e.config.WarmupDuration
+
+	type milestone struct {
+		pct  int
+		mask int
+	}
+	for _, m := range []milestone{{25, 1}, {50, 2}, {75, 4}, {100, 8}} {
+		threshold := target * m.pct / 100
+		if tickCount >= threshold && e.warmupLogged&m.mask == 0 {
+			e.warmupLogged |= m.mask
+			if m.pct < 100 {
+				e.logger.Infof("⏳ warmup %d%% (%d/%d ticks, %s)", m.pct, tickCount, target, elapsed)
+			} else if !durationMet {
+				e.logger.Infof("⏳ warmup ticks ready (%d/%d) — waiting for %s duration", tickCount, target, e.config.WarmupDuration)
+			}
+		}
+	}
+
+	if durationMet && tickCount >= target && e.warmupLogged&16 == 0 {
+		e.warmupLogged |= 16
+		e.logger.Infof("✅ warmup complete (%d ticks, %s)", tickCount, elapsed)
+	}
 }

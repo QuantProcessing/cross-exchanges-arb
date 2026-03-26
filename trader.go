@@ -45,6 +45,7 @@ type Trader struct {
 	lastLogTime     time.Time    // for stable position log interval
 	state           ExecutionState
 	completedRounds int
+	roundID         int // auto-incrementing round identifier for log tracing
 	openFlow        *openFlowState
 
 	// Parent context from Start(); used for shutdown-aware operations.
@@ -56,6 +57,10 @@ type Trader struct {
 	// For maker-taker mode: order update channel
 	makerOrderCh chan *exchanges.Order
 	takerOrderCh chan *exchanges.Order
+}
+
+func (t *Trader) roundTag() string {
+	return fmt.Sprintf("R%03d", t.roundID)
 }
 
 // NewTrader creates a new trader.
@@ -124,21 +129,14 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 		return
 	}
 	t.lastSignalTime = now
+	t.roundID++
+	roundTag := fmt.Sprintf("R%03d", t.roundID)
 
-	t.logger.Infow("🟢 SIGNAL detected",
-		"direction", sig.Direction,
-		"spread", fmt.Sprintf("%.2f bps", sig.SpreadBps),
-		"Z", fmt.Sprintf("%.2f", sig.ZScore),
-		"expectedProfit", fmt.Sprintf("%.2f bps", sig.ExpectedProfit),
-		"makerAsk", sig.MakerAsk,
-		"takerBid", sig.TakerBid,
-	)
+	t.logger.Infof("%s 🟢 signal  %s  spread=%.1fbps Z=%.2f profit=%.1fbps",
+		roundTag, sig.Direction, sig.SpreadBps, sig.ZScore, sig.ExpectedProfit)
 
 	if t.config.DryRun {
-		t.logger.Infow("🔸 [DRY RUN] Would open position",
-			"direction", sig.Direction,
-			"qty", t.config.Quantity,
-		)
+		t.logger.Infof("%s 🔸 [DRY] open %s qty=%s", roundTag, sig.Direction, t.config.Quantity)
 		t.position = &ArbPosition{
 			Direction:    sig.Direction,
 			OpenSpread:   sig.SpreadBps,
@@ -209,7 +207,7 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 		ClientID:    cid,
 	})
 	if err != nil {
-		t.logger.Errorw("❌ maker order failed", "err", err)
+		t.logger.Errorf("%s ❌ maker failed: %v", t.roundTag(), err)
 		go telegram.Notify(fmt.Sprintf("❌ Maker order failed: %v", err))
 		t.resetOpenFlow(StateIdle)
 		return
@@ -226,12 +224,8 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 	t.state = StateWaitingFill
 	t.mu.Unlock()
 
-	t.logger.Infow("📌 Maker order placed, waiting for fill...",
-		"exchange", t.config.MakerExchange,
-		"side", makerSide,
-		"price", makerPrice,
-		"cid", cid,
-	)
+	t.logger.Infof("%s 📌 maker %s %s %s qty=%s cid=%s",
+		t.roundTag(), makerSide, t.config.MakerExchange, makerPrice, qty, cid)
 
 	// Wait for maker fill with timeout.
 	timeout := time.NewTimer(t.config.MakerTimeout)
@@ -241,14 +235,14 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 		select {
 		case update := <-t.makerOrderCh:
 			if done, err := t.handleMakerOrderUpdate(ctx, update, makerOrder, cid, qty); err != nil {
-				t.logger.Errorw("failed to process maker update", "err", err)
+				t.logger.Errorf("%s maker update error: %v", t.roundTag(), err)
 				return
 			} else if done {
 				return
 			}
 		case <-timeout.C:
 			if err := t.handleMakerTimeout(ctx); err != nil {
-				t.logger.Warnw("maker timeout handling failed", "err", err)
+				t.logger.Warnf("%s timeout handling failed: %v", t.roundTag(), err)
 			}
 			return
 		case <-ctx.Done():
@@ -294,14 +288,13 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 	t.state = StateClosing
 	t.mu.Unlock()
 
-	t.logger.Infow("⏰ maker order timed out, cancelling...",
-		"orderID", flow.makerOrder.OrderID)
+	t.logger.Infof("%s ⏰ timeout, cancelling order %s", t.roundTag(), flow.makerOrder.OrderID)
 
 	// Step 1: Cancel the maker order.
 	if flow.makerOrder != nil {
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := t.maker.CancelOrder(cancelCtx, flow.makerOrder.OrderID, t.config.Symbol); err != nil {
-			t.logger.Warnw("maker cancel failed after timeout", "err", err, "orderID", flow.makerOrder.OrderID)
+			t.logger.Warnf("%s cancel failed: %v", t.roundTag(), err)
 		}
 		cancel()
 	}
@@ -315,8 +308,7 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 	}
 
 	// Step 3: Channel didn't deliver — REST fallback to fetch order status.
-	t.logger.Infow("channel settlement timed out, using REST fallback",
-		"orderID", flow.makerOrder.OrderID)
+	t.logger.Infof("%s 🔄 REST fallback for %s", t.roundTag(), flow.makerOrder.OrderID)
 
 	filledQty := decimal.Zero
 	if flow.makerOrder != nil {
@@ -324,7 +316,7 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 		order, err := t.maker.FetchOrderByID(restCtx, flow.makerOrder.OrderID, t.config.Symbol)
 		restCancel()
 		if err != nil {
-			t.logger.Errorw("REST fallback FetchOrderByID failed", "err", err, "orderID", flow.makerOrder.OrderID)
+			t.logger.Errorf("%s REST fallback failed: %v", t.roundTag(), err)
 			go telegram.Notify(fmt.Sprintf("⚠️ Maker order status unknown after timeout\nOrderID: %s\nErr: %v",
 				flow.makerOrder.OrderID, err))
 			t.resetOpenFlow(StateIdle)
@@ -332,10 +324,7 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 		}
 		if order != nil {
 			filledQty = order.FilledQuantity
-			t.logger.Infow("REST order status",
-				"orderID", order.OrderID,
-				"status", order.Status,
-				"filledQty", filledQty)
+			t.logger.Infof("%s REST status=%s filled=%s", t.roundTag(), order.Status, filledQty)
 		}
 	}
 
@@ -354,8 +343,7 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 		}
 		t.finalizeOpenFlow(flow.makerOrder, filledQty)
 	} else {
-		t.logger.Infow("maker order had no fills after timeout, returning to idle",
-			"orderID", flow.makerOrder.OrderID)
+		t.logger.Infof("%s no fills after timeout, idle", t.roundTag())
 		t.resetOpenFlow(StateIdle)
 	}
 
@@ -474,8 +462,7 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 		flow.takerSide, delta, slippage,
 	)
 	if err != nil {
-		t.logger.Errorw("❌ hedge order failed — UNHEDGED EXPOSURE!",
-			"err", err, "qty", delta)
+		t.logger.Errorf("%s ❌ hedge failed — UNHEDGED qty=%s: %v", t.roundTag(), delta, err)
 		go telegram.Notify(fmt.Sprintf("🚨 HEDGE FAILED — UNHEDGED EXPOSURE!\nQty: %s\nErr: %v", delta, err))
 		t.mu.Lock()
 		t.state = StateManualIntervention
@@ -494,7 +481,7 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := t.maker.CancelOrder(cancelCtx, orderID, t.config.Symbol); err != nil {
-				t.logger.Warnw("partial fill cancel failed", "err", err, "orderID", orderID)
+				t.logger.Warnf("%s partial cancel failed: %v", t.roundTag(), err)
 			}
 		}(makerOrder.OrderID)
 	}
@@ -537,13 +524,10 @@ func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal
 	t.openFlow = nil
 	t.mu.Unlock()
 
-	t.logger.Infow("✅ Position opened (maker-taker)",
-		"long", longName, "short", shortName,
-		"spread", fmt.Sprintf("%.2f bps", flow.signal.SpreadBps),
-		"filled", filledQty,
-	)
-	go telegram.Notify(fmt.Sprintf("✅ Opened (maker-taker)\nLong %s / Short %s\nSpread: %.2f bps | Z: %.2f | Qty: %s",
-		longName, shortName, flow.signal.SpreadBps, flow.signal.ZScore, filledQty))
+	t.logger.Infof("%s ✅ opened  long=%s short=%s spread=%.1fbps qty=%s",
+		t.roundTag(), longName, shortName, flow.signal.SpreadBps, filledQty)
+	go telegram.Notify(fmt.Sprintf("✅ %s Opened\nLong %s / Short %s\nSpread: %.1fbps | Z: %.2f | Qty: %s",
+		t.roundTag(), longName, shortName, flow.signal.SpreadBps, flow.signal.ZScore, filledQty))
 }
 
 func (t *Trader) resetOpenFlow(state ExecutionState) {
@@ -622,12 +606,8 @@ func (t *Trader) checkCloseConditions() {
 		// Log status periodically (every 10 seconds, using timestamp for stable interval)
 		now := time.Now()
 		if t.lastLogTime.IsZero() || now.Sub(t.lastLogTime) >= 10*time.Second {
-			t.logger.Infow("📊 holding position",
-				"direction", pos.Direction,
-				"openSpread", fmt.Sprintf("%.2f bps", pos.OpenSpread),
-				"currentZ", fmt.Sprintf("%.2f", currentZ),
-				"holdTime", holdTime.Round(time.Second),
-			)
+			t.logger.Infof("%s 📊 hold  Z=%.2f (open=%.1fbps) %s",
+				t.roundTag(), currentZ, pos.OpenSpread, holdTime.Round(time.Second))
 			t.lastLogTime = now
 		}
 		return
@@ -647,17 +627,11 @@ func (t *Trader) closePosition(reason string) {
 	t.state = StateClosing
 	t.mu.Unlock()
 
-	t.logger.Infow("🔴 Closing position",
-		"reason", reason,
-		"direction", pos.Direction,
-		"holdTime", time.Since(pos.OpenTime).Round(time.Second),
-	)
+	t.logger.Infof("%s 🔴 closing  %s  held=%s",
+		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second))
 
 	if t.config.DryRun {
-		t.logger.Infow("🔸 [DRY RUN] Would close position",
-			"direction", pos.Direction,
-			"openSpread", fmt.Sprintf("%.2f bps", pos.OpenSpread),
-		)
+		t.logger.Infof("%s 🔸 [DRY] close %s", t.roundTag(), pos.Direction)
 		t.finishSuccessfulClose()
 		return
 	}
@@ -720,14 +694,14 @@ func (t *Trader) closePosition(reason string) {
 		if res.err == nil {
 			continue
 		}
-		t.logger.Errorw("❌ close leg failed", "leg", res.leg, "err", res.err)
+		t.logger.Errorf("%s ❌ close %s leg: %v", t.roundTag(), res.leg, res.err)
 		failures = append(failures, fmt.Sprintf("%s leg: %v", res.leg, res.err))
 	}
 
 	// Retry failed legs once before going to ManualIntervention.
 	if len(failures) > 0 {
 		failures = nil // reset for retry
-		t.logger.Infow("🔄 retrying failed close legs...", "results", results)
+		t.logger.Infof("%s 🔄 retrying failed close legs", t.roundTag())
 		retryCtx, retryCancel := context.WithTimeout(closeCtx, 15*time.Second)
 		defer retryCancel()
 
@@ -747,10 +721,10 @@ func (t *Trader) closePosition(reason string) {
 				retryCtx, exchange, t.config.Symbol, side, qty, slippage,
 			)
 			if retryErr != nil {
-				t.logger.Errorw("❌ close leg retry failed", "leg", leg, "err", retryErr)
+				t.logger.Errorf("%s ❌ %s leg retry: %v", t.roundTag(), leg, retryErr)
 				failures = append(failures, fmt.Sprintf("%s leg (retry): %v", leg, retryErr))
 			} else {
-				t.logger.Infow("✅ close leg retry succeeded", "leg", leg, "orderID", retryOrder.OrderID)
+				t.logger.Infof("%s ✅ %s leg retry ok", t.roundTag(), leg)
 				results[leg] = closeLegResult{leg: leg, order: retryOrder}
 			}
 		}
@@ -775,23 +749,20 @@ func (t *Trader) closePosition(reason string) {
 		}
 		t.state = StateManualIntervention
 		t.mu.Unlock()
-		t.logger.Errorw("❌ close failed - manual intervention required",
-			"reason", reason,
-			"residualLeg", residualLeg,
-			"failures", strings.Join(failures, "; "),
-		)
+		t.logger.Errorf("%s ❌ CLOSE FAILED residual=%s: %s", t.roundTag(), residualLeg, strings.Join(failures, "; "))
 		go telegram.Notify(fmt.Sprintf(
-			"🚨 CLOSE FAILED - MANUAL INTERVENTION REQUIRED\nReason: %s\nResidual leg: %s\nOpen qty: %s\nFailures: %s",
-			reason, residualLeg, pos.OpenQuantity, strings.Join(failures, "; "),
+			"🚨 %s CLOSE FAILED\nResidual: %s\nQty: %s\n%s",
+			t.roundTag(), residualLeg, pos.OpenQuantity, strings.Join(failures, "; "),
 		))
 		return
 	}
 
 	t.finishSuccessfulClose()
 
-	t.logger.Infow("✅ Position closed", "reason", reason)
-	go telegram.Notify(fmt.Sprintf("🔴 Position closed\nReason: %s\nHeld: %s",
-		reason, time.Since(pos.OpenTime).Round(time.Second)))
+	t.logger.Infof("%s ✅ closed  %s  round=%d/%d",
+		t.roundTag(), reason, t.completedRounds, t.config.MaxRounds)
+	go telegram.Notify(fmt.Sprintf("🔴 %s Closed\n%s\nHeld: %s",
+		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second)))
 }
 
 func (t *Trader) finishSuccessfulClose() {
