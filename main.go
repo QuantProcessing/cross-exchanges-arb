@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	exchanges "github.com/QuantProcessing/exchanges"
-	"github.com/QuantProcessing/exchanges/edgex"
-	"github.com/QuantProcessing/exchanges/lighter"
+	_ "github.com/QuantProcessing/exchanges/decibel"
+	_ "github.com/QuantProcessing/exchanges/lighter"
 	"github.com/QuantProcessing/notify/telegram"
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
@@ -63,16 +62,11 @@ func main() {
 
 	// Create adapters directly
 	logger.Infow("creating adapters...")
-	maker, err := createAdapter(ctx, cfg.MakerExchange, logger)
+	maker, taker, err := NewExchangePair(ctx, cfg)
 	if err != nil {
-		logger.Fatalw("failed to create maker adapter", "exchange", cfg.MakerExchange, "err", err)
+		logger.Fatalw("failed to create exchange pair", "maker", cfg.MakerExchange, "taker", cfg.TakerExchange, "err", err)
 	}
 	defer maker.Close()
-
-	taker, err := createAdapter(ctx, cfg.TakerExchange, logger)
-	if err != nil {
-		logger.Fatalw("failed to create taker adapter", "exchange", cfg.TakerExchange, "err", err)
-	}
 	defer taker.Close()
 
 	// Print exchange info
@@ -120,28 +114,6 @@ func main() {
 	}
 
 	logger.Infow("shutdown complete")
-}
-
-// createAdapter creates an exchange adapter using direct construction.
-func createAdapter(ctx context.Context, name string, logger *zap.SugaredLogger) (exchanges.Exchange, error) {
-	switch strings.ToUpper(name) {
-	case "EDGEX":
-		return edgex.NewAdapter(ctx, edgex.Options{
-			PrivateKey: os.Getenv("EXCHANGES_EDGEX_PRIVATE_KEY"),
-			AccountID:  os.Getenv("EXCHANGES_EDGEX_ACCOUNT_ID"),
-			Logger:     logger,
-		})
-	case "LIGHTER":
-		return lighter.NewAdapter(ctx, lighter.Options{
-			PrivateKey:   os.Getenv("EXCHANGES_LIGHTER_PRIVATE_KEY"),
-			AccountIndex: os.Getenv("EXCHANGES_LIGHTER_ACCOUNT_INDEX"),
-			KeyIndex:     os.Getenv("EXCHANGES_LIGHTER_KEY_INDEX"),
-			RoToken:      os.Getenv("EXCHANGES_LIGHTER_RO_TOKEN"),
-			Logger:       logger,
-		})
-	default:
-		return nil, fmt.Errorf("unsupported exchange %q: supported exchanges are EDGEX, LIGHTER", name)
-	}
 }
 
 // printExchangeInfo prints exchange price and symbol details at startup.

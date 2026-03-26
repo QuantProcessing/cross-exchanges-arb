@@ -8,31 +8,29 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-
 // Config holds all runtime configuration parsed from CLI flags.
 type Config struct {
 	// Exchange pair
-	MakerExchange string // exchange to place maker orders (e.g. "EDGEX")
+	MakerExchange string // exchange to place maker orders (e.g. "DECIBEL")
 	TakerExchange string // exchange to hedge/taker orders (e.g. "LIGHTER")
 
 	// Trading params
 	Symbol   string          // base currency symbol, e.g. "BTC"
-	Quantity decimal.Decimal  // order quantity in base currency
+	Quantity decimal.Decimal // order quantity in base currency
 
 	// Algorithm params (Z-Score)
-	WindowSize     int     // rolling window size in ticks (default: 500)
-	ZOpen          float64 // Z-Score threshold to open position (default: 2.0)
-	ZClose         float64 // Z-Score threshold to close position (default: 0.5)
-	ZStop          float64 // Z-Score threshold for stop-loss (default: -1.0)
-	MinProfitBps   float64 // minimum net profit in BPS after fees (default: 1.0)
-	WarmupTicks    int     // minimum ticks before signals are emitted (default: 200)
+	WindowSize     int           // rolling window size in ticks (default: 500)
+	ZOpen          float64       // Z-Score threshold to open position (default: 2.0)
+	ZClose         float64       // Z-Score threshold to close position (default: 0.5)
+	ZStop          float64       // Z-Score threshold for stop-loss (default: -1.0)
+	MinProfitBps   float64       // minimum net profit in BPS after fees (default: 1.0)
+	WarmupTicks    int           // minimum ticks before signals are emitted (default: 200)
 	WarmupDuration time.Duration // minimum time before signals are emitted (default: 3m)
 
 	// Safety params
 	Cooldown    time.Duration // cooldown between trades (default: 5s)
 	MaxHoldTime time.Duration // max position hold time before force close (default: 30m)
 	Slippage    float64       // slippage tolerance for market orders (default: 0.002 = 0.2%)
-
 
 	// Run modes
 	DryRun      bool // simulate only, no real orders
@@ -44,7 +42,7 @@ func ParseConfig() *Config {
 	c := &Config{}
 
 	// Exchange pair
-	flag.StringVar(&c.MakerExchange, "maker", "EDGEX", "Maker exchange name")
+	flag.StringVar(&c.MakerExchange, "maker", "DECIBEL", "Maker exchange name")
 	flag.StringVar(&c.TakerExchange, "taker", "LIGHTER", "Taker/hedge exchange name")
 
 	// Trading
@@ -91,7 +89,6 @@ func ParseConfig() *Config {
 	if err != nil {
 		panic(fmt.Sprintf("invalid max-hold %q: %v", *maxHold, err))
 	}
-
 
 	return c
 }
