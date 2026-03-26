@@ -14,6 +14,7 @@ const (
 )
 
 // CanAcceptSignal returns whether the trader may begin a new round from the given state.
+// Manual intervention and every unresolved execution state must remain blocked.
 func CanAcceptSignal(state ExecutionState) bool {
 	return state == StateIdle
 }

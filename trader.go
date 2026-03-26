@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"strings"
 	"time"
 
 	exchanges "github.com/QuantProcessing/exchanges"
@@ -519,7 +520,7 @@ func (t *Trader) monitorLoop(ctx context.Context) {
 func (t *Trader) checkCloseConditions() {
 	t.mu.Lock()
 	pos := t.position
-	if pos == nil {
+	if pos == nil || t.state != StatePositionOpen {
 		t.mu.Unlock()
 		return
 	}
@@ -575,10 +576,11 @@ func (t *Trader) checkCloseConditions() {
 func (t *Trader) closePosition(reason string) {
 	t.mu.Lock()
 	pos := t.position
-	if pos == nil {
+	if pos == nil || t.state != StatePositionOpen {
 		t.mu.Unlock()
 		return
 	}
+	t.state = StateClosing
 	t.mu.Unlock()
 
 	t.logger.Infow("🔴 Closing position",
@@ -594,6 +596,7 @@ func (t *Trader) closePosition(reason string) {
 		)
 		t.mu.Lock()
 		t.position = nil
+		t.state = StateIdle
 		t.mu.Unlock()
 		return
 	}
@@ -617,6 +620,11 @@ func (t *Trader) closePosition(reason string) {
 	// Close both sides concurrently (ReduceOnly)
 	var wg sync.WaitGroup
 	wg.Add(2)
+	type closeLegResult struct {
+		leg string
+		err error
+	}
+	errCh := make(chan closeLegResult, 2)
 
 	go func() {
 		defer wg.Done()
@@ -624,9 +632,7 @@ func (t *Trader) closePosition(reason string) {
 			ctx, longExchange, t.config.Symbol,
 			exchanges.OrderSideSell, qty, slippage,
 		)
-		if err != nil {
-			t.logger.Errorw("❌ close long failed", "err", err)
-		}
+		errCh <- closeLegResult{leg: "long", err: err}
 	}()
 
 	go func() {
@@ -635,15 +641,39 @@ func (t *Trader) closePosition(reason string) {
 			ctx, shortExchange, t.config.Symbol,
 			exchanges.OrderSideBuy, qty, slippage,
 		)
-		if err != nil {
-			t.logger.Errorw("❌ close short failed", "err", err)
-		}
+		errCh <- closeLegResult{leg: "short", err: err}
 	}()
 
 	wg.Wait()
+	close(errCh)
+
+	var failures []string
+	for res := range errCh {
+		if res.err == nil {
+			continue
+		}
+		t.logger.Errorw("❌ close leg failed", "leg", res.leg, "err", res.err)
+		failures = append(failures, fmt.Sprintf("%s leg: %v", res.leg, res.err))
+	}
+
+	if len(failures) > 0 {
+		t.mu.Lock()
+		t.state = StateManualIntervention
+		t.mu.Unlock()
+		t.logger.Errorw("❌ close failed - manual intervention required",
+			"reason", reason,
+			"failures", strings.Join(failures, "; "),
+		)
+		go telegram.Notify(fmt.Sprintf(
+			"🚨 CLOSE FAILED - MANUAL INTERVENTION REQUIRED\nReason: %s\nOpen qty: %s\nFailures: %s",
+			reason, pos.OpenQuantity, strings.Join(failures, "; "),
+		))
+		return
+	}
 
 	t.mu.Lock()
 	t.position = nil
+	t.state = StateIdle
 	t.mu.Unlock()
 
 	t.logger.Infow("✅ Position closed", "reason", reason)

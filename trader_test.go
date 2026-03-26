@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type testExchange struct {
 	placedQtys      []decimal.Decimal
 	cancelCalls     int
 	lastCancelOrder string
+	forcePlaceErr   error
 }
 
 func newTestExchange(name string) *testExchange {
@@ -53,6 +55,9 @@ func (e *testExchange) FetchKlines(ctx context.Context, symbol string, interval 
 func (e *testExchange) PlaceOrder(ctx context.Context, params *exchanges.OrderParams) (*exchanges.Order, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.forcePlaceErr != nil {
+		return nil, e.forcePlaceErr
+	}
 	e.placedQtys = append(e.placedQtys, params.Quantity)
 	return &exchanges.Order{
 		OrderID:        fmt.Sprintf("%s-%d", e.name, len(e.placedQtys)),
@@ -160,6 +165,23 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 	return tr, maker, taker
 }
 
+func newTestTrader() *Trader {
+	tr, _, _ := newActiveFlowTrader()
+	return tr
+}
+
+func newTestTraderWithPosition() *Trader {
+	tr, _, _ := newActiveFlowTrader()
+	tr.engine = &SpreadEngine{}
+	tr.position = &ArbPosition{
+		Direction:    LongMakerShortTaker,
+		OpenTime:     time.Now().Add(-time.Minute),
+		OpenQuantity: decimal.RequireFromString("0.001"),
+	}
+	tr.state = StatePositionOpen
+	return tr
+}
+
 func waitForTraderState(t *testing.T, tr *Trader, want ExecutionState) {
 	t.Helper()
 
@@ -210,6 +232,37 @@ func TestTrader_MakerTimeoutKeepsBlockedWhenSettlementUnknown(t *testing.T) {
 	}
 	if tr.openFlow == nil {
 		t.Fatal("openFlow was cleared, want active open-flow tracking")
+	}
+}
+
+func TestTrader_HedgeFailureMovesToManualIntervention(t *testing.T) {
+	tr := newTestTrader()
+	tr.taker.(*testExchange).forcePlaceErr = errors.New("boom")
+
+	_ = tr.handleMakerFillForTest(decimal.RequireFromString("0.001"))
+
+	if tr.state != StateManualIntervention {
+		t.Fatalf("state = %s, want manual_intervention", tr.state)
+	}
+	if tr.openFlow == nil || tr.openFlow.signal == nil {
+		t.Fatal("open-flow context was cleared, want residual position context for alerting")
+	}
+	if IsExecutableSignal(tr.state, DefaultExecutionProfile(), &SpreadSignal{}) {
+		t.Fatal("manual intervention must reject new signals")
+	}
+}
+
+func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
+	tr := newTestTraderWithPosition()
+	tr.taker.(*testExchange).forcePlaceErr = errors.New("close failed")
+
+	tr.closePosition("test")
+
+	if tr.state == StateIdle {
+		t.Fatal("close failure must not return to idle")
+	}
+	if tr.position == nil {
+		t.Fatal("close failure must preserve the open position for intervention")
 	}
 }
 
