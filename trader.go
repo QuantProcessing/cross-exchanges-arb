@@ -185,11 +185,19 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal, signalTime time.Time) {
 	if sig.Direction == LongMakerShortTaker {
 		makerSide = exchanges.OrderSideBuy
 		takerSide = exchanges.OrderSideSell
-		makerPrice = sig.MakerAsk // buy at ask (or slightly below for maker)
+		makerPrice = sig.MakerAsk // buy at ask
 	} else {
 		makerSide = exchanges.OrderSideSell
 		takerSide = exchanges.OrderSideBuy
-		makerPrice = sig.MakerBid // sell at bid (or slightly above for maker)
+		makerPrice = sig.MakerBid // sell at bid
+	}
+
+	// Apply 1 bps offset to stay on maker side and reduce PostOnly rejections
+	offset := makerPrice.Mul(decimal.NewFromFloat(0.0001)) // 1 bps
+	if makerSide == exchanges.OrderSideBuy {
+		makerPrice = makerPrice.Sub(offset) // lower buy price
+	} else {
+		makerPrice = makerPrice.Add(offset) // raise sell price
 	}
 
 	// Fetch precision for maker order
