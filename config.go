@@ -8,31 +8,34 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-
 // Config holds all runtime configuration parsed from CLI flags.
 type Config struct {
 	// Exchange pair
-	MakerExchange string // exchange to place maker orders (e.g. "EDGEX")
-	TakerExchange string // exchange to hedge/taker orders (e.g. "LIGHTER")
+	MakerExchange      string // exchange to place maker orders (e.g. "DECIBEL")
+	TakerExchange      string // exchange to hedge/taker orders (e.g. "LIGHTER")
+	MakerQuoteCurrency string // optional maker quote currency override
+	TakerQuoteCurrency string // optional taker quote currency override
 
 	// Trading params
 	Symbol   string          // base currency symbol, e.g. "BTC"
-	Quantity decimal.Decimal  // order quantity in base currency
+	Quantity decimal.Decimal // order quantity in base currency
 
 	// Algorithm params (Z-Score)
-	WindowSize     int     // rolling window size in ticks (default: 500)
-	ZOpen          float64 // Z-Score threshold to open position (default: 2.0)
-	ZClose         float64 // Z-Score threshold to close position (default: 0.5)
-	ZStop          float64 // Z-Score threshold for stop-loss (default: -1.0)
-	MinProfitBps   float64 // minimum net profit in BPS after fees (default: 1.0)
-	WarmupTicks    int     // minimum ticks before signals are emitted (default: 200)
+	WindowSize     int           // rolling window size in ticks (default: 500)
+	ZOpen          float64       // Z-Score threshold to open position (default: 2.0)
+	ZClose         float64       // Z-Score threshold to close position (default: 0.5)
+	ZStop          float64       // Z-Score threshold for stop-loss (default: -1.0)
+	MinProfitBps   float64       // minimum net profit in BPS after fees (default: 1.0)
+	WarmupTicks    int           // minimum ticks before signals are emitted (default: 200)
 	WarmupDuration time.Duration // minimum time before signals are emitted (default: 3m)
 
 	// Safety params
-	Cooldown    time.Duration // cooldown between trades (default: 5s)
-	MaxHoldTime time.Duration // max position hold time before force close (default: 30m)
-	Slippage    float64       // slippage tolerance for market orders (default: 0.002 = 0.2%)
-
+	Cooldown     time.Duration // cooldown between trades (default: 5s)
+	MaxHoldTime  time.Duration // max position hold time before force close (default: 30m)
+	Slippage     float64       // slippage tolerance for market orders (default: 0.002 = 0.2%)
+	MakerTimeout time.Duration // maker order timeout before cancel/reset
+	MaxRounds    int           // max completed rounds in live validation mode
+	LiveValidate bool          // live validation mode toggle
 
 	// Run modes
 	DryRun      bool // simulate only, no real orders
@@ -46,6 +49,8 @@ func ParseConfig() *Config {
 	// Exchange pair
 	flag.StringVar(&c.MakerExchange, "maker", "EDGEX", "Maker exchange name")
 	flag.StringVar(&c.TakerExchange, "taker", "LIGHTER", "Taker/hedge exchange name")
+	flag.StringVar(&c.MakerQuoteCurrency, "maker-quote-currency", "", "Optional maker quote currency override")
+	flag.StringVar(&c.TakerQuoteCurrency, "taker-quote-currency", "", "Optional taker quote currency override")
 
 	// Trading
 	flag.StringVar(&c.Symbol, "symbol", "BTC", "Trading symbol (base currency)")
@@ -64,6 +69,9 @@ func ParseConfig() *Config {
 	cooldown := flag.String("cooldown", "5s", "Cooldown between trades")
 	maxHold := flag.String("max-hold", "30m", "Max position hold time")
 	flag.Float64Var(&c.Slippage, "slippage", 0.002, "Slippage tolerance for market orders")
+	flag.DurationVar(&c.MakerTimeout, "maker-timeout", 15*time.Second, "Maker order timeout before cancel/reset")
+	flag.IntVar(&c.MaxRounds, "max-rounds", 1, "Maximum completed rounds in validation mode")
+	flag.BoolVar(&c.LiveValidate, "live-validate", true, "Enable live validation mode")
 
 	// Run modes
 	flag.BoolVar(&c.DryRun, "dry-run", false, "Simulate only, no real orders")
@@ -92,18 +100,17 @@ func ParseConfig() *Config {
 		panic(fmt.Sprintf("invalid max-hold %q: %v", *maxHold, err))
 	}
 
-
 	return c
 }
 
 // String returns a formatted summary of the config for the startup dashboard.
 func (c *Config) String() string {
 	mode := "LIVE"
-	if c.DryRun {
-		mode = "DRY RUN"
-	}
-	if c.ObserveOnly {
+	switch {
+	case c.ObserveOnly:
 		mode = "OBSERVE ONLY"
+	case c.DryRun:
+		mode = "DRY RUN"
 	}
 
 	return fmt.Sprintf(`
@@ -116,6 +123,7 @@ func (c *Config) String() string {
   Window: %d ticks   MinProfit: %.1f BPS
   Warmup: %d ticks / %s
   Cooldown: %s      MaxHold: %s     Slippage: %.2f%%
+  ValidationCfg: %-8s MakerTimeout: %-8s MaxRounds: %d
 ════════════════════════════════════════════════════════`,
 		c.MakerExchange, c.TakerExchange,
 		c.Symbol, c.Quantity.String(), mode,
@@ -123,5 +131,11 @@ func (c *Config) String() string {
 		c.WindowSize, c.MinProfitBps,
 		c.WarmupTicks, c.WarmupDuration,
 		c.Cooldown, c.MaxHoldTime, c.Slippage*100,
+		func() string {
+			if c.LiveValidate {
+				return "ENABLED"
+			}
+			return "DISABLED"
+		}(), c.MakerTimeout, c.MaxRounds,
 	)
 }
