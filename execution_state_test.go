@@ -19,6 +19,7 @@ func TestExecutionState_BlocksTradingInManualIntervention(t *testing.T) {
 
 func TestIsTerminalRoundBlocker_ExplicitStateContract(t *testing.T) {
 	blockingStates := []ExecutionState{
+		StatePlacingMaker,
 		StateWaitingFill,
 		StateHedging,
 		StatePositionOpen,
@@ -35,7 +36,6 @@ func TestIsTerminalRoundBlocker_ExplicitStateContract(t *testing.T) {
 func TestIsTerminalRoundBlocker_NonBlockingStates(t *testing.T) {
 	nonBlockingStates := []ExecutionState{
 		StateIdle,
-		StatePlacingMaker,
 		StateCooldown,
 	}
 	for _, state := range nonBlockingStates {
