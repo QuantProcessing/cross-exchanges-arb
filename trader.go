@@ -15,8 +15,8 @@ import (
 // ArbPosition represents an open arbitrage position.
 type ArbPosition struct {
 	Direction  SpreadDirection
-	OpenSpread float64         // spread BPS at open
-	OpenZScore float64         // Z-Score at open
+	OpenSpread float64 // spread BPS at open
+	OpenZScore float64 // Z-Score at open
 	OpenTime   time.Time
 
 	// Order details (nil in dry-run)
@@ -36,9 +36,10 @@ type Trader struct {
 	config *Config
 	logger *zap.SugaredLogger
 
-	mu       sync.Mutex
-	position *ArbPosition // nil = no open position
-	lastTrade time.Time   // for cooldown enforcement
+	mu        sync.Mutex
+	position  *ArbPosition // nil = no open position
+	lastTrade time.Time    // for cooldown enforcement
+	state     ExecutionState
 
 	// For maker-taker mode: order update channel
 	makerOrderCh chan *exchanges.Order
@@ -55,6 +56,7 @@ func NewTrader(maker, taker exchanges.Exchange, engine *SpreadEngine, cfg *Confi
 		logger:       logger,
 		makerOrderCh: make(chan *exchanges.Order, 100),
 		takerOrderCh: make(chan *exchanges.Order, 100),
+		state:        StateIdle,
 	}
 }
 
