@@ -453,6 +453,7 @@ func (t *Trader) handleMakerOrderUpdate(ctx context.Context, update *exchanges.O
 		if targetQty.GreaterThan(decimal.Zero) {
 			t.finalizeOpenFlow(makerOrder, targetQty)
 		} else {
+			t.logger.Infof("%s ⚠️ maker %s (no fills), idle", t.roundTag(), update.Status)
 			t.resetOpenFlow(StateIdle)
 		}
 		return true, nil
