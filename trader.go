@@ -14,10 +14,11 @@ import (
 
 // ArbPosition represents an open arbitrage position.
 type ArbPosition struct {
-	Direction  SpreadDirection
-	OpenSpread float64 // spread BPS at open
-	OpenZScore float64 // Z-Score at open
-	OpenTime   time.Time
+	Direction    SpreadDirection
+	OpenSpread   float64 // spread BPS at open
+	OpenZScore   float64 // Z-Score at open
+	OpenTime     time.Time
+	OpenQuantity decimal.Decimal
 
 	// Order details (nil in dry-run)
 	LongOrder  *exchanges.Order
@@ -132,10 +133,11 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 			"qty", t.config.Quantity,
 		)
 		t.position = &ArbPosition{
-			Direction:  sig.Direction,
-			OpenSpread: sig.SpreadBps,
-			OpenZScore: sig.ZScore,
-			OpenTime:   time.Now(),
+			Direction:    sig.Direction,
+			OpenSpread:   sig.SpreadBps,
+			OpenZScore:   sig.ZScore,
+			OpenTime:     time.Now(),
+			OpenQuantity: t.config.Quantity,
 		}
 		t.lastTrade = time.Now()
 		t.state = StatePositionOpen
@@ -471,6 +473,7 @@ func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal
 		OpenSpread:    flow.signal.SpreadBps,
 		OpenZScore:    flow.signal.ZScore,
 		OpenTime:      time.Now(),
+		OpenQuantity:  filledQty,
 		LongOrder:     makerOrder,
 		ShortOrder:    flow.lastHedgeOrder,
 		LongExchange:  longName,
@@ -599,6 +602,9 @@ func (t *Trader) closePosition(reason string) {
 	defer cancel()
 
 	qty := t.config.Quantity
+	if pos.OpenQuantity.GreaterThan(decimal.Zero) {
+		qty = pos.OpenQuantity
+	}
 	slippage := decimal.NewFromFloat(t.config.Slippage)
 
 	var longExchange, shortExchange exchanges.Exchange

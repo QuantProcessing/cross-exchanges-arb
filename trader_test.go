@@ -213,8 +213,9 @@ func TestTrader_MakerTimeoutKeepsBlockedWhenSettlementUnknown(t *testing.T) {
 	}
 }
 
-func TestTrader_HandleSignalTransitionsIntoOpenWorkflow(t *testing.T) {
-	tr, maker, _ := newActiveFlowTrader()
+func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testing.T) {
+	tr, maker, taker := newActiveFlowTrader()
+	tr.config.MakerTimeout = 50 * time.Millisecond
 	sig := &SpreadSignal{
 		Direction:      LongMakerShortTaker,
 		SpreadBps:      12.5,
@@ -236,11 +237,50 @@ func TestTrader_HandleSignalTransitionsIntoOpenWorkflow(t *testing.T) {
 	}
 
 	waitForTraderState(t, tr, StateWaitingFill)
-	waitForMakerOrders(t, maker, 1)
-	if tr.openFlow == nil {
-		t.Fatal("openFlow was not initialized by HandleSignal")
+	tr.makerOrderCh <- &exchanges.Order{
+		OrderID:        "maker-1",
+		ClientOrderID:  "cid-1",
+		Status:         exchanges.OrderStatusPartiallyFilled,
+		FilledQuantity: decimal.RequireFromString("0.001"),
 	}
-	if tr.state != StateWaitingFill {
-		t.Fatalf("state = %s, want waiting_fill", tr.state)
+	waitForTraderState(t, tr, StateWaitingFill)
+	waitForTraderState(t, tr, StateClosing)
+
+	tr.makerOrderCh <- &exchanges.Order{
+		OrderID:        "maker-1",
+		ClientOrderID:  "cid-1",
+		Status:         exchanges.OrderStatusCancelled,
+		FilledQuantity: decimal.RequireFromString("0.001"),
+	}
+
+	waitForTraderState(t, tr, StatePositionOpen)
+	waitForMakerOrders(t, maker, 1)
+	if tr.position == nil {
+		t.Fatal("position was not opened")
+	}
+	if !tr.position.OpenQuantity.Equal(decimal.RequireFromString("0.001")) {
+		t.Fatalf("open quantity = %s, want 0.001", tr.position.OpenQuantity)
+	}
+
+	tr.closePosition("test-close")
+
+	maker.mu.Lock()
+	makerQtys := append([]decimal.Decimal(nil), maker.placedQtys...)
+	maker.mu.Unlock()
+	if len(makerQtys) != 2 {
+		t.Fatalf("maker order count = %d, want 2", len(makerQtys))
+	}
+	if !makerQtys[1].Equal(decimal.RequireFromString("0.001")) {
+		t.Fatalf("close maker qty = %s, want 0.001", makerQtys[1])
+	}
+
+	taker.mu.Lock()
+	takerQtys := append([]decimal.Decimal(nil), taker.placedQtys...)
+	taker.mu.Unlock()
+	if len(takerQtys) != 2 {
+		t.Fatalf("taker order count = %d, want 2", len(takerQtys))
+	}
+	if !takerQtys[1].Equal(decimal.RequireFromString("0.001")) {
+		t.Fatalf("close taker qty = %s, want 0.001", takerQtys[1])
 	}
 }
