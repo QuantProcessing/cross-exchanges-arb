@@ -61,7 +61,7 @@ func ParseConfig() *Config {
 	flag.Float64Var(&c.ZOpen, "z-open", 2.0, "Z-Score threshold to open position")
 	flag.Float64Var(&c.ZClose, "z-close", 0.5, "Z-Score threshold to close position")
 	flag.Float64Var(&c.ZStop, "z-stop", -1.0, "Z-Score for stop-loss (negative = spread reversed)")
-	flag.Float64Var(&c.MinProfitBps, "min-profit", 5.0, "Minimum net profit BPS after fees")
+	flag.Float64Var(&c.MinProfitBps, "min-profit", 10.0, "Minimum net profit BPS after fees")
 	flag.IntVar(&c.WarmupTicks, "warmup-ticks", 200, "Minimum ticks before trading")
 	warmupDur := flag.String("warmup-duration", "3m", "Minimum duration before trading")
 
