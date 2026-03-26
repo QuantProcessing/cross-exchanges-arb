@@ -3,7 +3,7 @@ module github.com/QuantProcessing/cross-exchanges-arb
 go 1.26.0
 
 require (
-	github.com/QuantProcessing/exchanges v0.2.2
+	github.com/QuantProcessing/exchanges v0.2.3
 	github.com/QuantProcessing/notify v0.1.0
 	github.com/joho/godotenv v1.5.1
 	github.com/shopspring/decimal v1.4.0

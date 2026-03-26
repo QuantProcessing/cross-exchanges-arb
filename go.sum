@@ -6,6 +6,8 @@ github.com/QuantProcessing/exchanges v0.2.1 h1:JHB5qPOvJn0n9yEqCR5eAj03cwjZZCJJP
 github.com/QuantProcessing/exchanges v0.2.1/go.mod h1:3+vaEeL+nf3M3VSGcVWyGj2WWfnIvP4ue0uzd/dyVvs=
 github.com/QuantProcessing/exchanges v0.2.2 h1:7nWHYnZ9QynzKuiftSGcg6G8smPZIgvgs3b635tFP+c=
 github.com/QuantProcessing/exchanges v0.2.2/go.mod h1:3+vaEeL+nf3M3VSGcVWyGj2WWfnIvP4ue0uzd/dyVvs=
+github.com/QuantProcessing/exchanges v0.2.3 h1:C67jGlhxTT0sNUlJ/Wo/H1EJD60sotihNUvU5QsYMRw=
+github.com/QuantProcessing/exchanges v0.2.3/go.mod h1:3+vaEeL+nf3M3VSGcVWyGj2WWfnIvP4ue0uzd/dyVvs=
 github.com/QuantProcessing/notify v0.1.0 h1:Q0wvcWEpI5LnMwogGt7lrgqegchBj5lq8W8cozkLHls=
 github.com/QuantProcessing/notify v0.1.0/go.mod h1:WnL5r9OZ8p1blJ+QDpW+2XXHQV4e6RIFR7i2uUWBw/8=
 github.com/aptos-labs/aptos-go-sdk v1.10.0 h1:cMzmfML2LBzzpE+Z3Lq2ETTKsIdaYSI2gEiiWl8tz80=
