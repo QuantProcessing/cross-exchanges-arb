@@ -49,6 +49,9 @@ type Trader struct {
 	// Parent context from Start(); used for shutdown-aware operations.
 	ctx context.Context
 
+	// PnL tracking (optional, set via SetPnLTracker).
+	pnl *PnLTracker
+
 	// For maker-taker mode: order update channel
 	makerOrderCh chan *exchanges.Order
 	takerOrderCh chan *exchanges.Order
@@ -66,6 +69,11 @@ func NewTrader(maker, taker exchanges.Exchange, engine *SpreadEngine, cfg *Confi
 		takerOrderCh: make(chan *exchanges.Order, 100),
 		state:        StateIdle,
 	}
+}
+
+// SetPnLTracker attaches a PnL tracker to the trader.
+func (t *Trader) SetPnLTracker(p *PnLTracker) {
+	t.pnl = p
 }
 
 // Start begins the trader's monitoring loops.
@@ -277,6 +285,10 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 	t.state = StateClosing
 	t.mu.Unlock()
 
+	t.logger.Infow("⏰ maker order timed out, cancelling...",
+		"orderID", flow.makerOrder.OrderID)
+
+	// Step 1: Cancel the maker order.
 	if flow.makerOrder != nil {
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := t.maker.CancelOrder(cancelCtx, flow.makerOrder.OrderID, t.config.Symbol); err != nil {
@@ -285,20 +297,57 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 		cancel()
 	}
 
-	waitTimeout := t.config.MakerTimeout
-	if waitTimeout <= 0 {
-		waitTimeout = 5 * time.Second
-	}
-	waitCtx, cancel := context.WithTimeout(context.Background(), waitTimeout)
-	defer cancel()
-
-	settled, err := t.settleMakerFlow(waitCtx, flow)
+	// Step 2: Wait up to 3s for WatchOrders channel to deliver terminal status.
+	waitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	settled, _ := t.settleMakerFlow(waitCtx, flow)
+	cancel()
 	if settled {
 		return nil
 	}
-	if err != nil {
-		t.logger.Warnw("waiting for maker terminal status failed", "err", err)
-		return err
+
+	// Step 3: Channel didn't deliver — REST fallback to fetch order status.
+	t.logger.Infow("channel settlement timed out, using REST fallback",
+		"orderID", flow.makerOrder.OrderID)
+
+	filledQty := decimal.Zero
+	if flow.makerOrder != nil {
+		restCtx, restCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		order, err := t.maker.FetchOrderByID(restCtx, flow.makerOrder.OrderID, t.config.Symbol)
+		restCancel()
+		if err != nil {
+			t.logger.Errorw("REST fallback FetchOrderByID failed", "err", err, "orderID", flow.makerOrder.OrderID)
+			go telegram.Notify(fmt.Sprintf("⚠️ Maker order status unknown after timeout\nOrderID: %s\nErr: %v",
+				flow.makerOrder.OrderID, err))
+			t.resetOpenFlow(StateIdle)
+			return err
+		}
+		if order != nil {
+			filledQty = order.FilledQuantity
+			t.logger.Infow("REST order status",
+				"orderID", order.OrderID,
+				"status", order.Status,
+				"filledQty", filledQty)
+		}
+	}
+
+	// Step 4: If any quantity was filled, hedge it; otherwise go idle.
+	if filledQty.GreaterThan(decimal.Zero) {
+		hedgeOrder, err := t.hedgeMakerDelta(ctx, flow.makerOrder, filledQty)
+		if err != nil {
+			return err
+		}
+		if hedgeOrder != nil {
+			t.mu.Lock()
+			if t.openFlow != nil {
+				t.openFlow.lastHedgeOrder = hedgeOrder
+			}
+			t.mu.Unlock()
+		}
+		t.finalizeOpenFlow(flow.makerOrder, filledQty)
+	} else {
+		t.logger.Infow("maker order had no fills after timeout, returning to idle",
+			"orderID", flow.makerOrder.OrderID)
+		t.resetOpenFlow(StateIdle)
 	}
 
 	return nil
@@ -507,6 +556,9 @@ func (t *Trader) monitorLoop(ctx context.Context) {
 		case <-ticker.C:
 			t.checkCloseConditions()
 			t.checkLoopControls()
+			if t.pnl != nil {
+				t.pnl.PeriodicRefresh(ctx)
+			}
 		}
 	}
 }
@@ -708,6 +760,15 @@ func (t *Trader) finishSuccessfulClose() {
 	t.lastTrade = time.Now()
 	t.completedRounds++
 	t.mu.Unlock()
+
+	// Refresh PnL after a successful round.
+	if t.pnl != nil {
+		ctx := t.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		t.pnl.OnRoundComplete(ctx)
+	}
 }
 
 func (t *Trader) releaseCooldownIfExpiredLocked(now time.Time) {

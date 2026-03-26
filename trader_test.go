@@ -230,16 +230,17 @@ func waitForMakerOrders(t *testing.T, maker *testExchange, want int) {
 	t.Fatalf("maker order count = %d, want %d", got, want)
 }
 
-func TestTrader_MakerTimeoutKeepsBlockedWhenSettlementUnknown(t *testing.T) {
+func TestTrader_MakerTimeoutWithNoFillsReturnsToIdle(t *testing.T) {
 	tr, _, _ := newActiveFlowTrader()
 
 	tr.handleMakerTimeoutForTest()
 
-	if tr.state == StateIdle {
-		t.Fatalf("state = %s, want blocked open-flow state", tr.state)
+	// With REST fallback: no fills → reset to idle.
+	if tr.state != StateIdle {
+		t.Fatalf("state = %s, want idle (REST fallback found no fills)", tr.state)
 	}
-	if tr.openFlow == nil {
-		t.Fatal("openFlow was cleared, want active open-flow tracking")
+	if tr.openFlow != nil {
+		t.Fatal("openFlow should be nil after no-fill timeout")
 	}
 }
 

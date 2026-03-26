@@ -95,6 +95,10 @@ func main() {
 	// Create trader
 	trader := NewTrader(maker, taker, engine, cfg, logger)
 
+	// Initialize PnL tracker (snapshots starting balances).
+	pnl := NewPnLTracker(ctx, maker, taker, cfg.MakerExchange, cfg.TakerExchange, logger)
+	trader.SetPnLTracker(pnl)
+
 	// Connect signal callback
 	engine.SetSignalCallback(trader.HandleSignal)
 
@@ -107,11 +111,19 @@ func main() {
 	}
 	logger.Infow("🚀 Starting spread monitoring...", "mode", mode)
 
+	// Send startup notification.
+	go telegram.Notify(fmt.Sprintf("🚀 Cross-Arb Started (%s)\n%s ↔ %s | %s\nQty: %s | MaxRounds: %d\nZ-Open: %.1f | Z-Close: %.1f | Z-Stop: %.1f\n──────────\n%s",
+		mode, cfg.MakerExchange, cfg.TakerExchange, cfg.Symbol,
+		cfg.Quantity, cfg.MaxRounds,
+		cfg.ZOpen, cfg.ZClose, cfg.ZStop,
+		pnl.StartupSummary()))
+
 	// Start spread engine (blocks until context done or error)
 	if err := engine.Start(ctx); err != nil && ctx.Err() == nil {
 		logger.Errorw("spread engine error", "err", err)
 	}
 
+	go telegram.Notify(fmt.Sprintf("🛑 Cross-Arb Stopped\nRounds completed: %d", pnl.rounds))
 	logger.Infow("shutdown complete")
 }
 
