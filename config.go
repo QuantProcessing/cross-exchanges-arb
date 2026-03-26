@@ -42,7 +42,7 @@ func ParseConfig() *Config {
 	c := &Config{}
 
 	// Exchange pair
-	flag.StringVar(&c.MakerExchange, "maker", "DECIBEL", "Maker exchange name")
+	flag.StringVar(&c.MakerExchange, "maker", "EDGEX", "Maker exchange name")
 	flag.StringVar(&c.TakerExchange, "taker", "LIGHTER", "Taker/hedge exchange name")
 
 	// Trading

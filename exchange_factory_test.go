@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"os"
 	"testing"
 
 	exchanges "github.com/QuantProcessing/exchanges"
@@ -115,5 +117,26 @@ func TestBuildExchangeConfigs_UsesLegacyAndCurrentEnvNames(t *testing.T) {
 	}
 	if got := currentTakerCfg.Options["ro_token"]; got != "current-lighter-token" {
 		t.Fatalf("current taker ro_token = %q, want %q", got, "current-lighter-token")
+	}
+}
+
+func TestParseConfig_DefaultMakerAndTaker(t *testing.T) {
+	origArgs := os.Args
+	origCommandLine := flag.CommandLine
+	t.Cleanup(func() {
+		os.Args = origArgs
+		flag.CommandLine = origCommandLine
+	})
+
+	os.Args = []string{"cross-exchanges-arb"}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+
+	cfg := ParseConfig()
+
+	if cfg.MakerExchange != "EDGEX" {
+		t.Fatalf("default maker = %q, want EDGEX", cfg.MakerExchange)
+	}
+	if cfg.TakerExchange != "LIGHTER" {
+		t.Fatalf("default taker = %q, want LIGHTER", cfg.TakerExchange)
 	}
 }
