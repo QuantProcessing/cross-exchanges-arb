@@ -108,6 +108,12 @@ type openFlowState struct {
 	makerQty       decimal.Decimal
 	hedgedQty      decimal.Decimal
 	lastHedgeOrder *exchanges.Order
+
+	// Timing
+	signalTime     time.Time // when signal was accepted
+	makerPlacedAt  time.Time // when PlaceOrder returned
+	fillDetectedAt time.Time // when WS/REST detected fill
+	hedgeDoneAt    time.Time // when hedge completed
 }
 
 // HandleSignal processes a signal from the SpreadEngine.
@@ -152,14 +158,15 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 
 	t.state = StatePlacingMaker
 	sigCopy := *sig
+	signalTime := now
 	t.mu.Unlock()
 
 	// Execute maker-taker asynchronously so HandleSignal only performs the idle -> placing_maker transition.
-	go t.openMakerTaker(&sigCopy)
+	go t.openMakerTaker(&sigCopy, signalTime)
 }
 
 // openMakerTaker places a maker order on maker exchange, then hedges via taker on fill.
-func (t *Trader) openMakerTaker(sig *SpreadSignal) {
+func (t *Trader) openMakerTaker(sig *SpreadSignal, signalTime time.Time) {
 	if sig == nil {
 		return
 	}
@@ -212,20 +219,24 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 		t.resetOpenFlow(StateIdle)
 		return
 	}
+	makerPlacedAt := time.Now()
 
 	t.mu.Lock()
 	t.openFlow = &openFlowState{
-		signal:     sig,
-		makerOrder: makerOrder,
-		makerSide:  makerSide,
-		takerSide:  takerSide,
-		makerQty:   qty,
+		signal:        sig,
+		makerOrder:    makerOrder,
+		makerSide:     makerSide,
+		takerSide:     takerSide,
+		makerQty:      qty,
+		signalTime:    signalTime,
+		makerPlacedAt: makerPlacedAt,
 	}
 	t.state = StateWaitingFill
 	t.mu.Unlock()
 
-	t.logger.Infof("%s 📌 maker %s %s %s qty=%s cid=%s",
-		t.roundTag(), makerSide, t.config.MakerExchange, makerPrice, qty, cid)
+	t.logger.Infof("%s 📌 maker %s %s %s qty=%s cid=%s (%dms)",
+		t.roundTag(), makerSide, t.config.MakerExchange, makerPrice, qty, cid,
+		makerPlacedAt.Sub(signalTime).Milliseconds())
 
 	// Wait for maker fill with timeout.
 	timeout := time.NewTimer(t.config.MakerTimeout)
@@ -401,6 +412,10 @@ func (t *Trader) handleMakerOrderUpdate(ctx context.Context, update *exchanges.O
 	if flow != nil && flow.makerOrder != nil && makerOrder != nil && flow.makerOrder.OrderID == makerOrder.OrderID {
 		flowQty = flow.makerQty
 	}
+	// Record fill detection time
+	if flow != nil && flow.fillDetectedAt.IsZero() {
+		flow.fillDetectedAt = time.Now()
+	}
 	t.mu.Unlock()
 
 	targetQty := update.FilledQuantity
@@ -409,16 +424,20 @@ func (t *Trader) handleMakerOrderUpdate(ctx context.Context, update *exchanges.O
 	}
 
 	if targetQty.GreaterThan(decimal.Zero) {
+		hedgeStart := time.Now()
 		hedgeOrder, err := t.hedgeMakerDelta(ctx, makerOrder, targetQty)
 		if err != nil {
 			return true, err
 		}
 		if hedgeOrder != nil {
+			hedgeDone := time.Now()
 			t.mu.Lock()
 			if t.openFlow != nil {
 				t.openFlow.lastHedgeOrder = hedgeOrder
+				t.openFlow.hedgeDoneAt = hedgeDone
 			}
 			t.mu.Unlock()
+			t.logger.Infof("%s 🚨 hedge done (%dms)", t.roundTag(), hedgeDone.Sub(hedgeStart).Milliseconds())
 		}
 	}
 
@@ -526,6 +545,25 @@ func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal
 
 	t.logger.Infof("%s ✅ opened  long=%s short=%s spread=%.1fbps qty=%s",
 		t.roundTag(), longName, shortName, flow.signal.SpreadBps, filledQty)
+
+	// Timing summary: signal → maker → fill → hedge → done
+	var timingParts []string
+	if !flow.signalTime.IsZero() && !flow.makerPlacedAt.IsZero() {
+		timingParts = append(timingParts, fmt.Sprintf("maker=%dms", flow.makerPlacedAt.Sub(flow.signalTime).Milliseconds()))
+	}
+	if !flow.makerPlacedAt.IsZero() && !flow.fillDetectedAt.IsZero() {
+		timingParts = append(timingParts, fmt.Sprintf("fill=%dms", flow.fillDetectedAt.Sub(flow.makerPlacedAt).Milliseconds()))
+	}
+	if !flow.fillDetectedAt.IsZero() && !flow.hedgeDoneAt.IsZero() {
+		timingParts = append(timingParts, fmt.Sprintf("hedge=%dms", flow.hedgeDoneAt.Sub(flow.fillDetectedAt).Milliseconds()))
+	}
+	if !flow.signalTime.IsZero() {
+		timingParts = append(timingParts, fmt.Sprintf("total=%dms", time.Since(flow.signalTime).Milliseconds()))
+	}
+	if len(timingParts) > 0 {
+		t.logger.Infof("%s ⏱ %s", t.roundTag(), strings.Join(timingParts, " "))
+	}
+
 	go telegram.Notify(fmt.Sprintf("✅ %s Opened\nLong %s / Short %s\nSpread: %.1fbps | Z: %.2f | Qty: %s",
 		t.roundTag(), longName, shortName, flow.signal.SpreadBps, flow.signal.ZScore, filledQty))
 }
@@ -629,6 +667,8 @@ func (t *Trader) closePosition(reason string) {
 
 	t.logger.Infof("%s 🔴 closing  %s  held=%s",
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second))
+
+	closeStart := time.Now()
 
 	if t.config.DryRun {
 		t.logger.Infof("%s 🔸 [DRY] close %s", t.roundTag(), pos.Direction)
@@ -759,8 +799,9 @@ func (t *Trader) closePosition(reason string) {
 
 	t.finishSuccessfulClose()
 
-	t.logger.Infof("%s ✅ closed  %s  round=%d/%d",
-		t.roundTag(), reason, t.completedRounds, t.config.MaxRounds)
+	t.logger.Infof("%s ✅ closed  %s  round=%d/%d (%dms)",
+		t.roundTag(), reason, t.completedRounds, t.config.MaxRounds,
+		time.Since(closeStart).Milliseconds())
 	go telegram.Notify(fmt.Sprintf("🔴 %s Closed\n%s\nHeld: %s",
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second)))
 }
