@@ -622,33 +622,36 @@ func (t *Trader) closePosition(reason string) {
 	wg.Add(2)
 	type closeLegResult struct {
 		leg string
+		order *exchanges.Order
 		err error
 	}
 	errCh := make(chan closeLegResult, 2)
 
 	go func() {
 		defer wg.Done()
-		_, err := exchanges.PlaceMarketOrderWithSlippage(
+		order, err := exchanges.PlaceMarketOrderWithSlippage(
 			ctx, longExchange, t.config.Symbol,
 			exchanges.OrderSideSell, qty, slippage,
 		)
-		errCh <- closeLegResult{leg: "long", err: err}
+		errCh <- closeLegResult{leg: "long", order: order, err: err}
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, err := exchanges.PlaceMarketOrderWithSlippage(
+		order, err := exchanges.PlaceMarketOrderWithSlippage(
 			ctx, shortExchange, t.config.Symbol,
 			exchanges.OrderSideBuy, qty, slippage,
 		)
-		errCh <- closeLegResult{leg: "short", err: err}
+		errCh <- closeLegResult{leg: "short", order: order, err: err}
 	}()
 
 	wg.Wait()
 	close(errCh)
 
 	var failures []string
+	results := make(map[string]closeLegResult, 2)
 	for res := range errCh {
+		results[res.leg] = res
 		if res.err == nil {
 			continue
 		}
@@ -657,16 +660,32 @@ func (t *Trader) closePosition(reason string) {
 	}
 
 	if len(failures) > 0 {
+		var residualLeg string
+		if results["long"].err == nil && results["short"].err != nil {
+			residualLeg = "short"
+		} else if results["short"].err == nil && results["long"].err != nil {
+			residualLeg = "long"
+		}
+
 		t.mu.Lock()
+		if t.position != nil && residualLeg != "" {
+			switch residualLeg {
+			case "long":
+				t.position.ShortOrder = nil
+			case "short":
+				t.position.LongOrder = nil
+			}
+		}
 		t.state = StateManualIntervention
 		t.mu.Unlock()
 		t.logger.Errorw("❌ close failed - manual intervention required",
 			"reason", reason,
+			"residualLeg", residualLeg,
 			"failures", strings.Join(failures, "; "),
 		)
 		go telegram.Notify(fmt.Sprintf(
-			"🚨 CLOSE FAILED - MANUAL INTERVENTION REQUIRED\nReason: %s\nOpen qty: %s\nFailures: %s",
-			reason, pos.OpenQuantity, strings.Join(failures, "; "),
+			"🚨 CLOSE FAILED - MANUAL INTERVENTION REQUIRED\nReason: %s\nResidual leg: %s\nOpen qty: %s\nFailures: %s",
+			reason, residualLeg, pos.OpenQuantity, strings.Join(failures, "; "),
 		))
 		return
 	}

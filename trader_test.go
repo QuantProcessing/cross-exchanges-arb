@@ -177,6 +177,14 @@ func newTestTraderWithPosition() *Trader {
 		Direction:    LongMakerShortTaker,
 		OpenTime:     time.Now().Add(-time.Minute),
 		OpenQuantity: decimal.RequireFromString("0.001"),
+		LongOrder: &exchanges.Order{
+			OrderID: "long-open",
+		},
+		ShortOrder: &exchanges.Order{
+			OrderID: "short-open",
+		},
+		LongExchange:  "maker",
+		ShortExchange: "taker",
 	}
 	tr.state = StatePositionOpen
 	return tr
@@ -263,6 +271,25 @@ func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
 	}
 	if tr.position == nil {
 		t.Fatal("close failure must preserve the open position for intervention")
+	}
+	if tr.position.LongOrder != nil {
+		t.Fatal("close failure must clear the closed long leg from memory")
+	}
+	if tr.position.ShortOrder == nil {
+		t.Fatal("close failure must retain the surviving short leg context")
+	}
+	tr.HandleSignal(&SpreadSignal{
+		Direction:      LongMakerShortTaker,
+		SpreadBps:      9.1,
+		ZScore:         2.2,
+		ExpectedProfit: 3.3,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99"),
+		TakerBid:       decimal.RequireFromString("101"),
+		TakerAsk:       decimal.RequireFromString("102"),
+	})
+	if tr.state != StateManualIntervention {
+		t.Fatalf("new signals must remain blocked after close failure, state = %s", tr.state)
 	}
 }
 
