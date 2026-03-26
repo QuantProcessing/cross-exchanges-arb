@@ -9,6 +9,16 @@ import (
 	exchanges "github.com/QuantProcessing/exchanges"
 )
 
+func TestDefaultExecutionProfile_UsesValidationDefaults(t *testing.T) {
+	p := DefaultExecutionProfile()
+	if !p.LiveValidation {
+		t.Fatal("expected live validation enabled by default for validation profile")
+	}
+	if p.EntryMakerOrderType != exchanges.OrderTypePostOnly {
+		t.Fatalf("entry type = %s, want post-only", p.EntryMakerOrderType)
+	}
+}
+
 func TestBuildExchangeConfigs_DefaultsToPerpValidationProfile(t *testing.T) {
 	cfg := &Config{
 		MakerExchange: "DECIBEL",
