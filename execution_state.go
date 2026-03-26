@@ -18,7 +18,8 @@ func CanAcceptSignal(state ExecutionState) bool {
 	return state == StateIdle
 }
 
-// IsTerminalRoundBlocker reports whether the state should block the next round until cleared.
+// IsTerminalRoundBlocker reports whether the state represents an in-flight or unresolved
+// round that must block the next round until the round is cleared.
 func IsTerminalRoundBlocker(state ExecutionState) bool {
 	switch state {
 	case StateWaitingFill, StateHedging, StatePositionOpen, StateClosing, StateManualIntervention:

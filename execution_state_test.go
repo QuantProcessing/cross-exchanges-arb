@@ -16,3 +16,31 @@ func TestExecutionState_BlocksTradingInManualIntervention(t *testing.T) {
 		t.Fatal("manual intervention must block trading")
 	}
 }
+
+func TestIsTerminalRoundBlocker_ExplicitStateContract(t *testing.T) {
+	blockingStates := []ExecutionState{
+		StateWaitingFill,
+		StateHedging,
+		StatePositionOpen,
+		StateClosing,
+		StateManualIntervention,
+	}
+	for _, state := range blockingStates {
+		if !IsTerminalRoundBlocker(state) {
+			t.Fatalf("%s must block the next round", state)
+		}
+	}
+}
+
+func TestIsTerminalRoundBlocker_NonBlockingStates(t *testing.T) {
+	nonBlockingStates := []ExecutionState{
+		StateIdle,
+		StatePlacingMaker,
+		StateCooldown,
+	}
+	for _, state := range nonBlockingStates {
+		if IsTerminalRoundBlocker(state) {
+			t.Fatalf("%s must not be terminal round blocker", state)
+		}
+	}
+}

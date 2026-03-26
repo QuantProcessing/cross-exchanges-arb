@@ -96,9 +96,7 @@ func main() {
 	trader := NewTrader(maker, taker, engine, cfg, logger)
 
 	// Connect signal callback
-	engine.SetSignalCallback(func(sig *SpreadSignal) {
-		trader.HandleSignal(sig)
-	})
+	engine.SetSignalCallback(trader.HandleSignal)
 
 	// Start trader monitoring
 	trader.Start(ctx)

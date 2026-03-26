@@ -87,6 +87,10 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if !IsExecutableSignal(t.state, DefaultExecutionProfile(), sig) {
+		return
+	}
+
 	// Already have open position? Check if close signal.
 	if t.position != nil {
 		return // close is handled by monitorLoop
