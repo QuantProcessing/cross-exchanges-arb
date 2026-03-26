@@ -84,11 +84,13 @@ func (t *Trader) Start(ctx context.Context) {
 }
 
 type openFlowState struct {
-	signal     *SpreadSignal
-	makerOrder *exchanges.Order
-	makerSide  exchanges.OrderSide
-	takerSide  exchanges.OrderSide
-	makerQty   decimal.Decimal
+	signal         *SpreadSignal
+	makerOrder     *exchanges.Order
+	makerSide      exchanges.OrderSide
+	takerSide      exchanges.OrderSide
+	makerQty       decimal.Decimal
+	hedgedQty      decimal.Decimal
+	lastHedgeOrder *exchanges.Order
 }
 
 // HandleSignal processes a signal from the SpreadEngine.
@@ -226,38 +228,10 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 	for {
 		select {
 		case update := <-t.makerOrderCh:
-			if !t.matchesOpenMakerOrder(update, makerOrder, cid) {
-				continue
-			}
-
-			switch update.Status {
-			case exchanges.OrderStatusFilled:
-				filledQty := update.FilledQuantity
-				if filledQty.IsZero() {
-					filledQty = qty
-				}
-				if err := t.handleMakerFill(ctx, filledQty); err != nil {
-					t.logger.Errorw("failed to hedge filled maker order", "err", err)
-				}
+			if done, err := t.handleMakerOrderUpdate(ctx, update, makerOrder, cid, qty); err != nil {
+				t.logger.Errorw("failed to process maker update", "err", err)
 				return
-			case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
-				filledQty := update.FilledQuantity
-				if filledQty.GreaterThan(decimal.Zero) {
-					if err := t.handleMakerFill(ctx, filledQty); err != nil {
-						t.logger.Errorw("failed to hedge maker fill during cancel", "err", err)
-					}
-					return
-				}
-				t.resetOpenFlow(StateIdle)
-				return
-			case exchanges.OrderStatusPartiallyFilled:
-				filledQty := update.FilledQuantity
-				if filledQty.IsZero() {
-					continue
-				}
-				if err := t.handleMakerFill(ctx, filledQty); err != nil {
-					t.logger.Errorw("failed to hedge partial maker fill", "err", err)
-				}
+			} else if done {
 				return
 			}
 		case <-timeout.C:
@@ -272,84 +246,29 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 }
 
 func (t *Trader) handleMakerFillForTest(filledQty decimal.Decimal) error {
-	return t.handleMakerFill(context.Background(), filledQty)
+	return t.hedgeMakerQty(context.Background(), filledQty)
 }
 
 func (t *Trader) handleMakerTimeoutForTest() {
 	_ = t.handleMakerTimeout(context.Background())
 }
 
-func (t *Trader) handleMakerFill(ctx context.Context, filledQty decimal.Decimal) error {
-	if filledQty.LessThanOrEqual(decimal.Zero) {
-		return nil
-	}
-
+func (t *Trader) hedgeMakerQty(ctx context.Context, filledQty decimal.Decimal) error {
 	t.mu.Lock()
 	flow := t.openFlow
-	if flow != nil {
-		t.state = StateHedging
-	}
 	t.mu.Unlock()
-
-	if flow == nil {
-		t.mu.Lock()
-		t.state = StatePositionOpen
-		t.mu.Unlock()
+	if flow == nil || flow.makerOrder == nil {
 		return nil
 	}
 
-	slippage := decimal.NewFromFloat(t.config.Slippage)
-	hedgeOrder, err := exchanges.PlaceMarketOrderWithSlippage(
-		ctx, t.taker, t.config.Symbol,
-		flow.takerSide, filledQty, slippage,
-	)
-	if err != nil {
-		t.logger.Errorw("❌ hedge order failed — UNHEDGED EXPOSURE!",
-			"err", err, "qty", filledQty)
-		go telegram.Notify(fmt.Sprintf("🚨 HEDGE FAILED — UNHEDGED EXPOSURE!\nQty: %s\nErr: %v", filledQty, err))
-		t.mu.Lock()
-		t.state = StateManualIntervention
-		t.mu.Unlock()
-		return err
+	update := &exchanges.Order{
+		OrderID:        flow.makerOrder.OrderID,
+		ClientOrderID:  flow.makerOrder.ClientOrderID,
+		Status:         exchanges.OrderStatusFilled,
+		FilledQuantity: filledQty,
 	}
-
-	if filledQty.LessThan(flow.makerQty) && flow.makerOrder != nil {
-		go func(orderID string) {
-			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = t.maker.CancelOrder(cancelCtx, orderID, t.config.Symbol)
-		}(flow.makerOrder.OrderID)
-	}
-
-	longName, shortName := t.config.MakerExchange, t.config.TakerExchange
-	if flow.signal.Direction == LongTakerShortMaker {
-		longName, shortName = shortName, longName
-	}
-
-	t.mu.Lock()
-	t.position = &ArbPosition{
-		Direction:     flow.signal.Direction,
-		OpenSpread:    flow.signal.SpreadBps,
-		OpenZScore:    flow.signal.ZScore,
-		OpenTime:      time.Now(),
-		LongOrder:     flow.makerOrder,
-		ShortOrder:    hedgeOrder,
-		LongExchange:  longName,
-		ShortExchange: shortName,
-	}
-	t.lastTrade = time.Now()
-	t.state = StatePositionOpen
-	t.openFlow = nil
-	t.mu.Unlock()
-
-	t.logger.Infow("✅ Position opened (maker-taker)",
-		"long", longName, "short", shortName,
-		"spread", fmt.Sprintf("%.2f bps", flow.signal.SpreadBps),
-		"filled", filledQty,
-	)
-	go telegram.Notify(fmt.Sprintf("✅ Opened (maker-taker)\nLong %s / Short %s\nSpread: %.2f bps | Z: %.2f | Qty: %s",
-		longName, shortName, flow.signal.SpreadBps, flow.signal.ZScore, filledQty))
-	return nil
+	_, err := t.handleMakerOrderUpdate(ctx, update, flow.makerOrder, "", flow.makerQty)
+	return err
 }
 
 func (t *Trader) handleMakerTimeout(ctx context.Context) error {
@@ -371,49 +290,23 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 		cancel()
 	}
 
-	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	waitTimeout := t.config.MakerTimeout
+	if waitTimeout <= 0 {
+		waitTimeout = 5 * time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 	defer cancel()
 
-	filledQty, err := t.waitForMakerTerminalStatus(waitCtx, flow)
-	if filledQty.GreaterThan(decimal.Zero) {
-		return t.handleMakerFill(ctx, filledQty)
+	settled, err := t.settleMakerFlow(waitCtx, flow)
+	if settled {
+		return nil
 	}
 	if err != nil {
 		t.logger.Warnw("waiting for maker terminal status failed", "err", err)
-		t.resetOpenFlow(StateIdle)
 		return err
 	}
 
-	t.resetOpenFlow(StateIdle)
 	return nil
-}
-
-func (t *Trader) waitForMakerTerminalStatus(ctx context.Context, flow *openFlowState) (decimal.Decimal, error) {
-	filledQty := decimal.Zero
-
-	for {
-		select {
-		case update := <-t.makerOrderCh:
-			if !t.matchesOpenMakerOrder(update, flow.makerOrder, "") {
-				continue
-			}
-
-			if update.FilledQuantity.GreaterThan(filledQty) {
-				filledQty = update.FilledQuantity
-			}
-			if update.Status == exchanges.OrderStatusFilled {
-				if filledQty.IsZero() {
-					filledQty = flow.makerQty
-				}
-				return filledQty, nil
-			}
-			if update.Status == exchanges.OrderStatusCancelled || update.Status == exchanges.OrderStatusRejected {
-				return filledQty, nil
-			}
-		case <-ctx.Done():
-			return filledQty, ctx.Err()
-		}
-	}
 }
 
 func (t *Trader) matchesOpenMakerOrder(update *exchanges.Order, makerOrder *exchanges.Order, clientID string) bool {
@@ -432,6 +325,169 @@ func (t *Trader) matchesOpenMakerOrder(update *exchanges.Order, makerOrder *exch
 		return true
 	}
 	return false
+}
+
+func (t *Trader) settleMakerFlow(ctx context.Context, flow *openFlowState) (bool, error) {
+	for {
+		select {
+		case update := <-t.makerOrderCh:
+			done, err := t.handleMakerOrderUpdate(ctx, update, flow.makerOrder, "", flow.makerQty)
+			if err != nil {
+				return false, err
+			}
+			if done {
+				return true, nil
+			}
+		case <-ctx.Done():
+			t.mu.Lock()
+			if t.openFlow != nil {
+				t.state = StateClosing
+			}
+			t.mu.Unlock()
+			return false, ctx.Err()
+		}
+	}
+}
+
+func (t *Trader) handleMakerOrderUpdate(ctx context.Context, update *exchanges.Order, makerOrder *exchanges.Order, clientID string, fallbackQty decimal.Decimal) (bool, error) {
+	if !t.matchesOpenMakerOrder(update, makerOrder, clientID) {
+		return false, nil
+	}
+
+	flowQty := fallbackQty
+	t.mu.Lock()
+	flow := t.openFlow
+	if flow != nil && flow.makerOrder != nil && makerOrder != nil && flow.makerOrder.OrderID == makerOrder.OrderID {
+		flowQty = flow.makerQty
+	}
+	t.mu.Unlock()
+
+	targetQty := update.FilledQuantity
+	if targetQty.IsZero() && update.Status == exchanges.OrderStatusFilled {
+		targetQty = flowQty
+	}
+
+	if targetQty.GreaterThan(decimal.Zero) {
+		hedgeOrder, err := t.hedgeMakerDelta(ctx, makerOrder, targetQty)
+		if err != nil {
+			return true, err
+		}
+		if hedgeOrder != nil {
+			t.mu.Lock()
+			if t.openFlow != nil {
+				t.openFlow.lastHedgeOrder = hedgeOrder
+			}
+			t.mu.Unlock()
+		}
+	}
+
+	switch update.Status {
+	case exchanges.OrderStatusPartiallyFilled:
+		t.mu.Lock()
+		if t.openFlow != nil {
+			t.state = StateWaitingFill
+		}
+		t.mu.Unlock()
+		return false, nil
+	case exchanges.OrderStatusFilled, exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
+		if targetQty.GreaterThan(decimal.Zero) {
+			t.finalizeOpenFlow(makerOrder, targetQty)
+		} else {
+			t.resetOpenFlow(StateIdle)
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Order, targetQty decimal.Decimal) (*exchanges.Order, error) {
+	t.mu.Lock()
+	flow := t.openFlow
+	if flow == nil {
+		t.mu.Unlock()
+		return nil, nil
+	}
+	delta := targetQty.Sub(flow.hedgedQty)
+	if delta.LessThanOrEqual(decimal.Zero) {
+		t.mu.Unlock()
+		return nil, nil
+	}
+	t.mu.Unlock()
+
+	slippage := decimal.NewFromFloat(t.config.Slippage)
+	hedgeOrder, err := exchanges.PlaceMarketOrderWithSlippage(
+		ctx, t.taker, t.config.Symbol,
+		flow.takerSide, delta, slippage,
+	)
+	if err != nil {
+		t.logger.Errorw("❌ hedge order failed — UNHEDGED EXPOSURE!",
+			"err", err, "qty", delta)
+		go telegram.Notify(fmt.Sprintf("🚨 HEDGE FAILED — UNHEDGED EXPOSURE!\nQty: %s\nErr: %v", delta, err))
+		t.mu.Lock()
+		t.state = StateManualIntervention
+		t.mu.Unlock()
+		return nil, err
+	}
+
+	t.mu.Lock()
+	if t.openFlow != nil && targetQty.GreaterThan(t.openFlow.hedgedQty) {
+		t.openFlow.hedgedQty = targetQty
+	}
+	t.mu.Unlock()
+
+	if targetQty.LessThan(flow.makerQty) && makerOrder != nil {
+		go func(orderID string) {
+			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = t.maker.CancelOrder(cancelCtx, orderID, t.config.Symbol)
+		}(makerOrder.OrderID)
+	}
+
+	t.mu.Lock()
+	if t.openFlow != nil && targetQty.GreaterThanOrEqual(t.openFlow.hedgedQty) && targetQty.LessThan(t.openFlow.makerQty) {
+		t.state = StateWaitingFill
+	}
+	t.mu.Unlock()
+
+	return hedgeOrder, nil
+}
+
+func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal.Decimal) {
+	t.mu.Lock()
+	flow := t.openFlow
+	if flow == nil {
+		t.mu.Unlock()
+		return
+	}
+
+	longName, shortName := t.config.MakerExchange, t.config.TakerExchange
+	if flow.signal.Direction == LongTakerShortMaker {
+		longName, shortName = shortName, longName
+	}
+
+	t.position = &ArbPosition{
+		Direction:     flow.signal.Direction,
+		OpenSpread:    flow.signal.SpreadBps,
+		OpenZScore:    flow.signal.ZScore,
+		OpenTime:      time.Now(),
+		LongOrder:     makerOrder,
+		ShortOrder:    flow.lastHedgeOrder,
+		LongExchange:  longName,
+		ShortExchange: shortName,
+	}
+	t.lastTrade = time.Now()
+	t.state = StatePositionOpen
+	t.openFlow = nil
+	t.mu.Unlock()
+
+	t.logger.Infow("✅ Position opened (maker-taker)",
+		"long", longName, "short", shortName,
+		"spread", fmt.Sprintf("%.2f bps", flow.signal.SpreadBps),
+		"filled", filledQty,
+	)
+	go telegram.Notify(fmt.Sprintf("✅ Opened (maker-taker)\nLong %s / Short %s\nSpread: %.2f bps | Z: %.2f | Qty: %s",
+		longName, shortName, flow.signal.SpreadBps, flow.signal.ZScore, filledQty))
 }
 
 func (t *Trader) resetOpenFlow(state ExecutionState) {
