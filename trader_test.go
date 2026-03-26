@@ -329,6 +329,18 @@ func TestTrader_MaxRoundsDoesNotBlockDryRun(t *testing.T) {
 	}
 }
 
+func TestTrader_MaxRoundsDoesNotBlockWhenLiveValidationDisabled(t *testing.T) {
+	tr := newTestTrader()
+	tr.completedRounds = 1
+	tr.config.DryRun = false
+	tr.config.LiveValidate = false
+	tr.config.MaxRounds = 1
+
+	if !tr.canStartNextRound() {
+		t.Fatal("expected non-live trading to bypass max-round gating")
+	}
+}
+
 func TestTrader_CooldownExpiryReturnsToIdle(t *testing.T) {
 	tr := newTestTraderWithPosition()
 	tr.config.Cooldown = 100 * time.Millisecond
