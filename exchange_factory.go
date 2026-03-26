@@ -106,7 +106,7 @@ func buildExchangeRuntimeConfig(name, quoteCurrency string) ExchangeRuntimeConfi
 			"LIGHTER_RO_TOKEN",
 		)
 	default:
-		rc.Options = map[string]string{}
+		// Keep existing options (e.g. quote_currency) for unknown exchanges.
 	}
 
 	return rc

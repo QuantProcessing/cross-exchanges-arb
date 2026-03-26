@@ -12,25 +12,6 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func TestDefaultExecutionProfile_UsesValidationDefaults(t *testing.T) {
-	p := DefaultExecutionProfile()
-	if !p.LiveValidation {
-		t.Fatal("expected live validation enabled by default for validation profile")
-	}
-	if p.EntryMakerOrderType != exchanges.OrderTypePostOnly {
-		t.Fatalf("entry type = %s, want post-only", p.EntryMakerOrderType)
-	}
-	if !p.HedgeUsesSlippage {
-		t.Fatal("expected hedge slippage enabled by default")
-	}
-	if p.MakerTimeout != 15*time.Second {
-		t.Fatalf("maker timeout = %s, want 15s", p.MakerTimeout)
-	}
-	if p.MaxRounds != 1 {
-		t.Fatalf("max rounds = %d, want 1", p.MaxRounds)
-	}
-}
-
 func TestBuildExchangeConfigs_DefaultsToPerpValidationProfile(t *testing.T) {
 	cfg := &Config{
 		MakerExchange: "DECIBEL",

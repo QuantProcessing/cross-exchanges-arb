@@ -41,9 +41,13 @@ type Trader struct {
 	mu              sync.Mutex
 	position        *ArbPosition // nil = no open position
 	lastTrade       time.Time    // for cooldown enforcement
+	lastLogTime     time.Time    // for stable position log interval
 	state           ExecutionState
 	completedRounds int
 	openFlow        *openFlowState
+
+	// Parent context from Start(); used for shutdown-aware operations.
+	ctx context.Context
 
 	// For maker-taker mode: order update channel
 	makerOrderCh chan *exchanges.Order
@@ -66,19 +70,15 @@ func NewTrader(maker, taker exchanges.Exchange, engine *SpreadEngine, cfg *Confi
 
 // Start begins the trader's monitoring loops.
 func (t *Trader) Start(ctx context.Context) {
+	t.ctx = ctx
+
 	// Subscribe to order updates for maker-taker fill tracking
 	if !t.config.DryRun {
 		go t.maker.WatchOrders(ctx, func(o *exchanges.Order) {
-			select {
-			case t.makerOrderCh <- o:
-			default:
-			}
+			t.makerOrderCh <- o
 		})
 		go t.taker.WatchOrders(ctx, func(o *exchanges.Order) {
-			select {
-			case t.takerOrderCh <- o:
-			default:
-			}
+			t.takerOrderCh <- o
 		})
 	}
 
@@ -149,7 +149,10 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	qty := t.config.Quantity
 
@@ -432,7 +435,9 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 		go func(orderID string) {
 			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_ = t.maker.CancelOrder(cancelCtx, orderID, t.config.Symbol)
+			if err := t.maker.CancelOrder(cancelCtx, orderID, t.config.Symbol); err != nil {
+				t.logger.Warnw("partial fill cancel failed", "err", err, "orderID", orderID)
+			}
 		}(makerOrder.OrderID)
 	}
 
@@ -553,14 +558,16 @@ func (t *Trader) checkCloseConditions() {
 	}
 
 	if reason == "" {
-		// Log status periodically
-		if holdTime > 0 && int(holdTime.Seconds())%10 == 0 {
+		// Log status periodically (every 10 seconds, using timestamp for stable interval)
+		now := time.Now()
+		if t.lastLogTime.IsZero() || now.Sub(t.lastLogTime) >= 10*time.Second {
 			t.logger.Infow("📊 holding position",
 				"direction", pos.Direction,
 				"openSpread", fmt.Sprintf("%.2f bps", pos.OpenSpread),
 				"currentZ", fmt.Sprintf("%.2f", currentZ),
 				"holdTime", holdTime.Round(time.Second),
 			)
+			t.lastLogTime = now
 		}
 		return
 	}
@@ -594,7 +601,11 @@ func (t *Trader) closePosition(reason string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	closeCtx := t.ctx
+	if closeCtx == nil {
+		closeCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(closeCtx, 10*time.Second)
 	defer cancel()
 
 	qty := t.config.Quantity

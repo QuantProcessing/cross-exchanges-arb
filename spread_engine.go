@@ -14,64 +14,57 @@ import (
 	"go.uber.org/zap"
 )
 
-// --- Spread Statistics (Rolling Window) ---
+// --- Spread Statistics (Rolling Window / Ring Buffer) ---
 
-// SpreadStats maintains rolling statistics (mean, stddev) over a fixed window.
+// SpreadStats maintains rolling statistics (mean, stddev) over a fixed-size ring buffer.
+// The ring buffer prevents memory leaks from slice reslicing.
 type SpreadStats struct {
-	window  []float64
+	buf     []float64
 	maxSize int
-	sum     float64
-	sumSq   float64
+	count   int // total items written (capped at maxSize)
+	writeAt int // next write position
+	mean    float64
+	stddev  float64
+	dirty   bool
 }
 
 // NewSpreadStats creates a new stats tracker with the given window size.
 func NewSpreadStats(windowSize int) *SpreadStats {
+	if windowSize < 1 {
+		windowSize = 1
+	}
 	return &SpreadStats{
-		window:  make([]float64, 0, windowSize),
+		buf:     make([]float64, windowSize),
 		maxSize: windowSize,
+		dirty:   true,
 	}
 }
 
-// Add inserts a new spread value and maintains the rolling window.
+// Add inserts a new spread value into the ring buffer.
 func (s *SpreadStats) Add(spread float64) {
-	if len(s.window) >= s.maxSize {
-		// Remove oldest
-		old := s.window[0]
-		s.window = s.window[1:]
-		s.sum -= old
-		s.sumSq -= old * old
+	s.buf[s.writeAt] = spread
+	s.writeAt = (s.writeAt + 1) % s.maxSize
+	if s.count < s.maxSize {
+		s.count++
 	}
-	s.window = append(s.window, spread)
-	s.sum += spread
-	s.sumSq += spread * spread
+	s.dirty = true
 }
 
 // Count returns the number of samples in the window.
 func (s *SpreadStats) Count() int {
-	return len(s.window)
+	return s.count
 }
 
 // Mean returns the rolling mean.
 func (s *SpreadStats) Mean() float64 {
-	n := len(s.window)
-	if n == 0 {
-		return 0
-	}
-	return s.sum / float64(n)
+	s.recomputeIfDirty()
+	return s.mean
 }
 
 // StdDev returns the rolling standard deviation.
 func (s *SpreadStats) StdDev() float64 {
-	n := len(s.window)
-	if n < 2 {
-		return 0
-	}
-	mean := s.sum / float64(n)
-	variance := s.sumSq/float64(n) - mean*mean
-	if variance < 0 {
-		variance = 0 // numerical safety
-	}
-	return math.Sqrt(variance)
+	s.recomputeIfDirty()
+	return s.stddev
 }
 
 // ZScore returns the Z-Score of a given spread value relative to the rolling distribution.
@@ -81,6 +74,56 @@ func (s *SpreadStats) ZScore(spread float64) float64 {
 		return 0
 	}
 	return (spread - s.Mean()) / sd
+}
+
+// activeSlice returns the current valid data in insertion order.
+func (s *SpreadStats) activeSlice() []float64 {
+	if s.count < s.maxSize {
+		return s.buf[:s.count]
+	}
+	// Ring buffer is full: writeAt points to the oldest element.
+	result := make([]float64, s.maxSize)
+	copy(result, s.buf[s.writeAt:])
+	copy(result[s.maxSize-s.writeAt:], s.buf[:s.writeAt])
+	return result
+}
+
+func (s *SpreadStats) recomputeIfDirty() {
+	if !s.dirty {
+		return
+	}
+
+	data := s.activeSlice()
+	if len(data) == 0 {
+		s.mean = 0
+		s.stddev = 0
+		s.dirty = false
+		return
+	}
+
+	// Welford's online algorithm for numerically stable single-pass computation.
+	mean := 0.0
+	m2 := 0.0
+	for i, sample := range data {
+		delta := sample - mean
+		mean += delta / float64(i+1)
+		delta2 := sample - mean
+		m2 += delta * delta2
+	}
+
+	s.mean = mean
+	if len(data) < 2 {
+		s.stddev = 0
+		s.dirty = false
+		return
+	}
+
+	variance := m2 / float64(len(data))
+	if variance < 0 {
+		variance = 0
+	}
+	s.stddev = math.Sqrt(variance)
+	s.dirty = false
 }
 
 // --- Spread Signal ---
@@ -260,6 +303,7 @@ func (e *SpreadEngine) Close() {
 }
 
 // onBBOUpdate is called whenever either exchange's BBO updates.
+// It is called concurrently from maker and taker WatchOrderBook goroutines.
 func (e *SpreadEngine) onBBOUpdate() {
 	e.mu.Lock()
 	makerBid := e.makerBid
@@ -296,7 +340,9 @@ func (e *SpreadEngine) onBBOUpdate() {
 	// BA: makerBid - takerAsk → if positive, can buy on taker, sell on maker
 	spreadBA, _ := makerBid.Sub(takerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
 
-	// Track warmup
+	// Protect warmup tracking and stats with the engine mutex to avoid data races
+	// between concurrent maker/taker WatchOrderBook goroutines.
+	e.mu.Lock()
 	if e.firstSeen.IsZero() {
 		e.firstSeen = time.Now()
 	}
@@ -307,38 +353,48 @@ func (e *SpreadEngine) onBBOUpdate() {
 	e.statsBA.Add(spreadBA)
 
 	now := time.Now()
-	warmedUp := e.tickCount >= e.config.WarmupTicks &&
+	tickCount := e.tickCount
+	warmedUp := tickCount >= e.config.WarmupTicks &&
 		now.Sub(e.firstSeen) >= e.config.WarmupDuration
 
 	// Calculate Z-Scores
 	zAB := e.statsAB.ZScore(spreadAB)
 	zBA := e.statsBA.ZScore(spreadBA)
 
+	// Snapshot stats values while still under lock
+	meanAB := e.statsAB.Mean()
+	stddevAB := e.statsAB.StdDev()
+	meanBA := e.statsBA.Mean()
+	stddevBA := e.statsBA.StdDev()
+	e.mu.Unlock()
+
 	// CSV output for observe-only mode
 	if e.csvWriter != nil {
-		e.csvWriter.Write([]string{
+		if err := e.csvWriter.Write([]string{
 			now.Format(time.RFC3339Nano),
 			makerBid.String(), makerAsk.String(),
 			takerBid.String(), takerAsk.String(),
 			fmt.Sprintf("%.4f", spreadAB), fmt.Sprintf("%.4f", spreadBA),
-			fmt.Sprintf("%.4f", e.statsAB.Mean()), fmt.Sprintf("%.4f", e.statsAB.StdDev()), fmt.Sprintf("%.4f", zAB),
-			fmt.Sprintf("%.4f", e.statsBA.Mean()), fmt.Sprintf("%.4f", e.statsBA.StdDev()), fmt.Sprintf("%.4f", zBA),
-		})
+			fmt.Sprintf("%.4f", meanAB), fmt.Sprintf("%.4f", stddevAB), fmt.Sprintf("%.4f", zAB),
+			fmt.Sprintf("%.4f", meanBA), fmt.Sprintf("%.4f", stddevBA), fmt.Sprintf("%.4f", zBA),
+		}); err != nil {
+			e.logger.Warnw("CSV write failed", "err", err)
+		}
 	}
 
 	// Log periodic status
-	if e.tickCount%50 == 0 {
+	if tickCount%50 == 0 {
 		if !warmedUp {
 			e.logger.Infow("warming up",
-				"ticks", fmt.Sprintf("%d/%d", e.tickCount, e.config.WarmupTicks),
+				"ticks", fmt.Sprintf("%d/%d", tickCount, e.config.WarmupTicks),
 				"elapsed", now.Sub(e.firstSeen).Round(time.Second),
 			)
 		} else {
 			e.logger.Infow("spread status",
 				"AB", fmt.Sprintf("%.2f bps (Z=%.2f)", spreadAB, zAB),
 				"BA", fmt.Sprintf("%.2f bps (Z=%.2f)", spreadBA, zBA),
-				"μ_AB", fmt.Sprintf("%.2f", e.statsAB.Mean()),
-				"σ_AB", fmt.Sprintf("%.2f", e.statsAB.StdDev()),
+				"μ_AB", fmt.Sprintf("%.2f", meanAB),
+				"σ_AB", fmt.Sprintf("%.2f", stddevAB),
 			)
 		}
 	}
@@ -348,19 +404,19 @@ func (e *SpreadEngine) onBBOUpdate() {
 		return
 	}
 
-	// Evaluate signals
+	// Evaluate signals (use snapshotted stats values from above)
 	fees := e.roundTripFeeBps()
 
 	// Check AB direction: Long maker, Short taker
 	if zAB > e.config.ZOpen {
-		expectedProfit := spreadAB - e.statsAB.Mean()
+		expectedProfit := spreadAB - meanAB
 		if expectedProfit > fees+e.config.MinProfitBps {
 			e.emitSignal(&SpreadSignal{
 				Direction:      LongMakerShortTaker,
 				SpreadBps:      spreadAB,
 				ZScore:         zAB,
-				Mean:           e.statsAB.Mean(),
-				StdDev:         e.statsAB.StdDev(),
+				Mean:           meanAB,
+				StdDev:         stddevAB,
 				ExpectedProfit: expectedProfit - fees,
 				MakerBid:       makerBid,
 				MakerAsk:       makerAsk,
@@ -373,14 +429,14 @@ func (e *SpreadEngine) onBBOUpdate() {
 
 	// Check BA direction: Long taker, Short maker
 	if zBA > e.config.ZOpen {
-		expectedProfit := spreadBA - e.statsBA.Mean()
+		expectedProfit := spreadBA - meanBA
 		if expectedProfit > fees+e.config.MinProfitBps {
 			e.emitSignal(&SpreadSignal{
 				Direction:      LongTakerShortMaker,
 				SpreadBps:      spreadBA,
 				ZScore:         zBA,
-				Mean:           e.statsBA.Mean(),
-				StdDev:         e.statsBA.StdDev(),
+				Mean:           meanBA,
+				StdDev:         stddevBA,
 				ExpectedProfit: expectedProfit - fees,
 				MakerBid:       makerBid,
 				MakerAsk:       makerAsk,
@@ -406,9 +462,9 @@ func (e *SpreadEngine) GetCurrentZ() (zAB, zBA float64) {
 	makerAsk := e.makerAsk
 	takerBid := e.takerBid
 	takerAsk := e.takerAsk
-	e.mu.Unlock()
 
 	if makerBid.IsZero() || takerBid.IsZero() {
+		e.mu.Unlock()
 		return 0, 0
 	}
 
@@ -417,17 +473,25 @@ func (e *SpreadEngine) GetCurrentZ() (zAB, zBA float64) {
 	midPrice := makerMid.Add(takerMid).Div(decimal.NewFromInt(2))
 
 	if midPrice.IsZero() {
+		e.mu.Unlock()
 		return 0, 0
 	}
 
 	spreadABVal, _ := takerBid.Sub(makerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
 	spreadBAVal, _ := makerBid.Sub(takerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
 
-	return e.statsAB.ZScore(spreadABVal), e.statsBA.ZScore(spreadBAVal)
+	// Access stats under lock to prevent concurrent read/write with onBBOUpdate.
+	zABResult := e.statsAB.ZScore(spreadABVal)
+	zBAResult := e.statsBA.ZScore(spreadBAVal)
+	e.mu.Unlock()
+
+	return zABResult, zBAResult
 }
 
 // IsWarmedUp returns whether the engine has enough data to emit signals.
 func (e *SpreadEngine) IsWarmedUp() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.tickCount >= e.config.WarmupTicks &&
 		time.Since(e.firstSeen) >= e.config.WarmupDuration
 }

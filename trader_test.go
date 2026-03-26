@@ -255,7 +255,7 @@ func TestTrader_HedgeFailureMovesToManualIntervention(t *testing.T) {
 	if tr.openFlow == nil || tr.openFlow.signal == nil {
 		t.Fatal("open-flow context was cleared, want residual position context for alerting")
 	}
-	if IsExecutableSignal(tr.state, DefaultExecutionProfile(), &SpreadSignal{}) {
+	if CanAcceptSignal(tr.state) {
 		t.Fatal("manual intervention must reject new signals")
 	}
 }
