@@ -111,8 +111,6 @@ func (c *Config) String() string {
 		mode = "OBSERVE ONLY"
 	case c.DryRun:
 		mode = "DRY RUN"
-	case c.LiveValidate:
-		mode = "LIVE VALIDATION"
 	}
 
 	return fmt.Sprintf(`
@@ -125,7 +123,7 @@ func (c *Config) String() string {
   Window: %d ticks   MinProfit: %.1f BPS
   Warmup: %d ticks / %s
   Cooldown: %s      MaxHold: %s     Slippage: %.2f%%
-  Validation: %-14s MakerTimeout: %-8s MaxRounds: %d
+  ValidationCfg: %-8s MakerTimeout: %-8s MaxRounds: %d
 ════════════════════════════════════════════════════════`,
 		c.MakerExchange, c.TakerExchange,
 		c.Symbol, c.Quantity.String(), mode,

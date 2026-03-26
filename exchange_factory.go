@@ -19,8 +19,8 @@ func BuildExchangeConfigs(cfg *Config) (ExchangeRuntimeConfig, ExchangeRuntimeCo
 	if cfg == nil {
 		return ExchangeRuntimeConfig{}, ExchangeRuntimeConfig{}
 	}
-	maker := buildExchangeRuntimeConfig(cfg.MakerExchange)
-	taker := buildExchangeRuntimeConfig(cfg.TakerExchange)
+	maker := buildExchangeRuntimeConfig(cfg.MakerExchange, cfg.MakerQuoteCurrency)
+	taker := buildExchangeRuntimeConfig(cfg.TakerExchange, cfg.TakerQuoteCurrency)
 	return maker, taker
 }
 
@@ -52,7 +52,7 @@ func NewExchangePair(ctx context.Context, cfg *Config) (exchanges.Exchange, exch
 	return maker, taker, nil
 }
 
-func buildExchangeRuntimeConfig(name string) ExchangeRuntimeConfig {
+func buildExchangeRuntimeConfig(name, quoteCurrency string) ExchangeRuntimeConfig {
 	normalized := strings.ToUpper(strings.TrimSpace(name))
 	rc := ExchangeRuntimeConfig{
 		Name:       normalized,
@@ -60,6 +60,9 @@ func buildExchangeRuntimeConfig(name string) ExchangeRuntimeConfig {
 		Options: map[string]string{
 			"quote_currency": string(exchanges.QuoteCurrencyUSDC),
 		},
+	}
+	if normalizedQuoteCurrency := strings.ToUpper(strings.TrimSpace(quoteCurrency)); normalizedQuoteCurrency != "" {
+		rc.Options["quote_currency"] = normalizedQuoteCurrency
 	}
 
 	switch normalized {

@@ -4,9 +4,12 @@ import (
 	"context"
 	"flag"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	exchanges "github.com/QuantProcessing/exchanges"
+	"github.com/shopspring/decimal"
 )
 
 func TestDefaultExecutionProfile_UsesValidationDefaults(t *testing.T) {
@@ -16,6 +19,15 @@ func TestDefaultExecutionProfile_UsesValidationDefaults(t *testing.T) {
 	}
 	if p.EntryMakerOrderType != exchanges.OrderTypePostOnly {
 		t.Fatalf("entry type = %s, want post-only", p.EntryMakerOrderType)
+	}
+	if !p.HedgeUsesSlippage {
+		t.Fatal("expected hedge slippage enabled by default")
+	}
+	if p.MakerTimeout != 15*time.Second {
+		t.Fatalf("maker timeout = %s, want 15s", p.MakerTimeout)
+	}
+	if p.MaxRounds != 1 {
+		t.Fatalf("max rounds = %d, want 1", p.MaxRounds)
 	}
 }
 
@@ -32,6 +44,30 @@ func TestBuildExchangeConfigs_DefaultsToPerpValidationProfile(t *testing.T) {
 	}
 	if takerCfg.MarketType != exchanges.MarketTypePerp {
 		t.Fatalf("taker market type = %s, want perp", takerCfg.MarketType)
+	}
+	if got := makerCfg.Options["quote_currency"]; got != string(exchanges.QuoteCurrencyUSDC) {
+		t.Fatalf("maker quote_currency = %q, want USDC", got)
+	}
+	if got := takerCfg.Options["quote_currency"]; got != string(exchanges.QuoteCurrencyUSDC) {
+		t.Fatalf("taker quote_currency = %q, want USDC", got)
+	}
+}
+
+func TestBuildExchangeConfigs_HonorsQuoteCurrencyOverrides(t *testing.T) {
+	cfg := &Config{
+		MakerExchange:      "DECIBEL",
+		TakerExchange:      "LIGHTER",
+		MakerQuoteCurrency: "usdt",
+		TakerQuoteCurrency: "USD",
+	}
+
+	makerCfg, takerCfg := BuildExchangeConfigs(cfg)
+
+	if got := makerCfg.Options["quote_currency"]; got != "USDT" {
+		t.Fatalf("maker quote_currency = %q, want USDT", got)
+	}
+	if got := takerCfg.Options["quote_currency"]; got != "USD" {
+		t.Fatalf("taker quote_currency = %q, want USD", got)
 	}
 }
 
@@ -148,5 +184,31 @@ func TestParseConfig_DefaultMakerAndTaker(t *testing.T) {
 	}
 	if cfg.TakerExchange != "LIGHTER" {
 		t.Fatalf("default taker = %q, want LIGHTER", cfg.TakerExchange)
+	}
+}
+
+func TestConfigString_ShowsValidationKnobsWithoutClaimingValidationMode(t *testing.T) {
+	cfg := &Config{
+		MakerExchange: "DECIBEL",
+		TakerExchange: "LIGHTER",
+		Symbol:        "BTC",
+		Quantity:      decimal.RequireFromString("0.001"),
+		LiveValidate:  true,
+		MakerTimeout:  20 * time.Second,
+		MaxRounds:     2,
+	}
+
+	summary := cfg.String()
+	if strings.Contains(summary, "LIVE VALIDATION") {
+		t.Fatal("startup summary must not claim live validation as the active runtime mode")
+	}
+	if !strings.Contains(summary, "ValidationCfg: ENABLED") {
+		t.Fatal("startup summary should expose validation config state")
+	}
+	if !strings.Contains(summary, "MakerTimeout: 20s") {
+		t.Fatal("startup summary should show maker timeout")
+	}
+	if !strings.Contains(summary, "MaxRounds: 2") {
+		t.Fatal("startup summary should show max rounds")
 	}
 }
