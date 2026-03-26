@@ -719,7 +719,7 @@ func (t *Trader) canStartNextRoundLocked(now time.Time) bool {
 	if t.state != StateIdle {
 		return false
 	}
-	if t.config != nil && t.config.LiveValidate && t.completedRounds >= t.config.MaxRounds {
+	if t.config != nil && !t.config.DryRun && t.config.LiveValidate && t.completedRounds >= t.config.MaxRounds {
 		return false
 	}
 	return true

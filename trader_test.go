@@ -317,6 +317,18 @@ func TestTrader_MaxRoundsStopsNewTrading(t *testing.T) {
 	}
 }
 
+func TestTrader_MaxRoundsDoesNotBlockDryRun(t *testing.T) {
+	tr := newTestTrader()
+	tr.completedRounds = 1
+	tr.config.DryRun = true
+	tr.config.LiveValidate = true
+	tr.config.MaxRounds = 1
+
+	if !tr.canStartNextRound() {
+		t.Fatal("expected dry-run trading to bypass max-round gating")
+	}
+}
+
 func TestTrader_CooldownExpiryReturnsToIdle(t *testing.T) {
 	tr := newTestTraderWithPosition()
 	tr.config.Cooldown = 100 * time.Millisecond
@@ -334,6 +346,17 @@ func TestTrader_CooldownExpiryReturnsToIdle(t *testing.T) {
 
 	if tr.state != StateIdle {
 		t.Fatalf("state = %s, want idle", tr.state)
+	}
+}
+
+func TestTrader_CompletedRoundsIncrementOncePerResolvedClose(t *testing.T) {
+	tr := newTestTraderWithPosition()
+
+	tr.closePosition("done")
+	tr.closePosition("done-again")
+
+	if tr.completedRounds != 1 {
+		t.Fatalf("completedRounds = %d, want 1", tr.completedRounds)
 	}
 }
 
