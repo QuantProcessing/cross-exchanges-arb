@@ -19,6 +19,7 @@ cross-arb
 
 # Agent skills
 .agent/
+.worktrees/
 
 # Data files
 spread_*.csv
