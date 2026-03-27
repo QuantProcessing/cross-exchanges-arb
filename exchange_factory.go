@@ -105,6 +105,15 @@ func buildExchangeRuntimeConfig(name, quoteCurrency string) ExchangeRuntimeConfi
 			"EXCHANGES_LIGHTER_RO_TOKEN",
 			"LIGHTER_RO_TOKEN",
 		)
+	case "HYPERLIQUID":
+		rc.Options["private_key"] = envFirst(
+			"EXCHANGES_HYPERLIQUID_PRIVATE_KEY",
+			"HYPERLIQUID_PRIVATE_KEY",
+		)
+		rc.Options["account_addr"] = envFirst(
+			"EXCHANGES_HYPERLIQUID_ACCOUNT_ADDR",
+			"HYPERLIQUID_ACCOUNT_ADDR",
+		)
 	default:
 		// Keep existing options (e.g. quote_currency) for unknown exchanges.
 	}
