@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,9 @@ type testExchange struct {
 	lastCancelOrder string
 	forcePlaceErr   error
 	watchOrdersErr  error
+	queuedOrders    []*exchanges.Order
+	ordersByID      map[string]*exchanges.Order
+	fetchOrderErr   error
 }
 
 func newTestExchange(name string) *testExchange {
@@ -65,7 +69,7 @@ func (e *testExchange) PlaceOrder(ctx context.Context, params *exchanges.OrderPa
 	e.placedQtys = append(e.placedQtys, params.Quantity)
 	paramsCopy := *params
 	e.placedOrders = append(e.placedOrders, &paramsCopy)
-	return &exchanges.Order{
+	order := &exchanges.Order{
 		OrderID:        fmt.Sprintf("%s-%d", e.name, len(e.placedQtys)),
 		Symbol:         params.Symbol,
 		Side:           params.Side,
@@ -74,7 +78,36 @@ func (e *testExchange) PlaceOrder(ctx context.Context, params *exchanges.OrderPa
 		Status:         exchanges.OrderStatusFilled,
 		FilledQuantity: params.Quantity,
 		ClientOrderID:  params.ClientID,
-	}, nil
+	}
+	if len(e.queuedOrders) > 0 && e.queuedOrders[0] != nil {
+		order = cloneTestOrder(e.queuedOrders[0])
+		e.queuedOrders = e.queuedOrders[1:]
+		if order.OrderID == "" {
+			order.OrderID = fmt.Sprintf("%s-%d", e.name, len(e.placedQtys))
+		}
+		if order.Symbol == "" {
+			order.Symbol = params.Symbol
+		}
+		if order.Side == "" {
+			order.Side = params.Side
+		}
+		if order.Type == "" {
+			order.Type = params.Type
+		}
+		if order.Quantity.IsZero() {
+			order.Quantity = params.Quantity
+		}
+		if order.ClientOrderID == "" {
+			order.ClientOrderID = params.ClientID
+		}
+		if order.Status == "" {
+			order.Status = exchanges.OrderStatusFilled
+		}
+		if order.Status == exchanges.OrderStatusFilled && order.FilledQuantity.IsZero() {
+			order.FilledQuantity = params.Quantity
+		}
+	}
+	return order, nil
 }
 func (e *testExchange) CancelOrder(ctx context.Context, orderID, symbol string) error {
 	e.mu.Lock()
@@ -90,7 +123,19 @@ func (e *testExchange) CancelAllOrders(ctx context.Context, symbol string) error
 	return nil
 }
 func (e *testExchange) FetchOrderByID(ctx context.Context, orderID, symbol string) (*exchanges.Order, error) {
-	return nil, nil
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fetchOrderErr != nil {
+		return nil, e.fetchOrderErr
+	}
+	if e.ordersByID == nil {
+		return nil, nil
+	}
+	order := e.ordersByID[orderID]
+	if order == nil {
+		return nil, nil
+	}
+	return cloneTestOrder(order), nil
 }
 func (e *testExchange) FetchOrders(ctx context.Context, symbol string) ([]exchanges.Order, error) {
 	return nil, nil
@@ -189,20 +234,31 @@ func newTestTraderWithPosition() *Trader {
 	tr, _, _ := newActiveFlowTrader()
 	tr.engine = &SpreadEngine{}
 	tr.position = &ArbPosition{
-		Direction:    LongMakerShortTaker,
-		OpenTime:     time.Now().Add(-time.Minute),
-		OpenQuantity: decimal.RequireFromString("0.001"),
+		Direction:          LongMakerShortTaker,
+		OpenTime:           time.Now().Add(-time.Minute),
+		OpenQuantity:       decimal.RequireFromString("0.001"),
+		OpenExpectedProfit: 4.2,
 		LongOrder: &exchanges.Order{
 			OrderID: "long-open",
+			Price:   decimal.RequireFromString("100"),
 		},
 		ShortOrder: &exchanges.Order{
 			OrderID: "short-open",
+			Price:   decimal.RequireFromString("101"),
 		},
 		LongExchange:  "maker",
 		ShortExchange: "taker",
 	}
 	tr.state = StatePositionOpen
 	return tr
+}
+
+func cloneTestOrder(order *exchanges.Order) *exchanges.Order {
+	if order == nil {
+		return nil
+	}
+	clone := *order
+	return &clone
 }
 
 func waitForTraderState(t *testing.T, tr *Trader, want ExecutionState) {
@@ -481,11 +537,11 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	tr.position = &ArbPosition{
-		Direction:    LongMakerShortTaker,
-		OpenTime:     time.Now().Add(-time.Minute),
-		OpenQuantity: decimal.RequireFromString("0.001"),
-		LongExchange: "maker",
-		ShortExchange:"taker",
+		Direction:     LongMakerShortTaker,
+		OpenTime:      time.Now().Add(-time.Minute),
+		OpenQuantity:  decimal.RequireFromString("0.001"),
+		LongExchange:  "maker",
+		ShortExchange: "taker",
 	}
 	tr.state = StatePositionOpen
 
@@ -551,5 +607,142 @@ func TestTrader_StartSucceedsWhenWatchOrdersStayActive(t *testing.T) {
 
 	if err := tr.Start(ctx); err != nil {
 		t.Fatalf("start error = %v, want nil", err)
+	}
+}
+
+func TestTrader_FinalizeOpenFlowAssignsLongShortOrdersByDirection(t *testing.T) {
+	tr, _, _ := newActiveFlowTrader()
+	tr.openFlow.signal.Direction = LongTakerShortMaker
+	tr.openFlow.lastHedgeOrder = &exchanges.Order{
+		OrderID: "taker-open",
+		Price:   decimal.RequireFromString("100"),
+	}
+	makerOrder := &exchanges.Order{
+		OrderID: "maker-open",
+		Price:   decimal.RequireFromString("101"),
+	}
+
+	tr.finalizeOpenFlow(makerOrder, decimal.RequireFromString("0.003"))
+
+	if tr.position == nil {
+		t.Fatal("position should be set")
+	}
+	if tr.position.LongExchange != "taker" {
+		t.Fatalf("long exchange = %s, want taker", tr.position.LongExchange)
+	}
+	if tr.position.ShortExchange != "maker" {
+		t.Fatalf("short exchange = %s, want maker", tr.position.ShortExchange)
+	}
+	if tr.position.LongOrder == nil || tr.position.LongOrder.OrderID != "taker-open" {
+		t.Fatalf("long order = %#v, want taker hedge order", tr.position.LongOrder)
+	}
+	if tr.position.ShortOrder == nil || tr.position.ShortOrder.OrderID != "maker-open" {
+		t.Fatalf("short order = %#v, want maker order", tr.position.ShortOrder)
+	}
+}
+
+func TestCalculateRealizedProfitMetrics_LongMakerShortTaker(t *testing.T) {
+	cfg := &Config{
+		MakerExchange: "maker",
+		TakerExchange: "taker",
+	}
+	pos := &ArbPosition{
+		Direction:     LongMakerShortTaker,
+		LongExchange:  "maker",
+		ShortExchange: "taker",
+		LongOrder: &exchanges.Order{
+			OrderID: "long-open",
+			Price:   decimal.RequireFromString("100"),
+		},
+		ShortOrder: &exchanges.Order{
+			OrderID: "short-open",
+			Price:   decimal.RequireFromString("101"),
+		},
+	}
+	closeLong := &exchanges.Order{
+		OrderID: "long-close",
+		Price:   decimal.RequireFromString("100.5"),
+	}
+	closeShort := &exchanges.Order{
+		OrderID: "short-close",
+		Price:   decimal.RequireFromString("100.2"),
+	}
+
+	metrics, err := calculateRealizedProfitMetrics(pos, cfg,
+		FeeInfo{MakerRate: 0.0001, TakerRate: 0.0003},
+		FeeInfo{MakerRate: 0.0002, TakerRate: 0.0004},
+		closeLong, closeShort,
+	)
+	if err != nil {
+		t.Fatalf("calculateRealizedProfitMetrics error = %v", err)
+	}
+
+	if diff := math.Abs(metrics.EntryBps - 99.50248756218905); diff > 1e-9 {
+		t.Fatalf("entry bps = %.12f, want %.12f", metrics.EntryBps, 99.50248756218905)
+	}
+	if diff := math.Abs(metrics.ExitBps - 29.895366218235893); diff > 1e-9 {
+		t.Fatalf("exit bps = %.12f, want %.12f", metrics.ExitBps, 29.895366218235893)
+	}
+	if diff := math.Abs(metrics.GrossBps - 129.449838187702); diff > 1e-9 {
+		t.Fatalf("gross bps = %.12f, want %.12f", metrics.GrossBps, 129.449838187702)
+	}
+	if diff := math.Abs(metrics.FeeBps - 12.011949215832713); diff > 1e-9 {
+		t.Fatalf("fee bps = %.12f, want %.12f", metrics.FeeBps, 12.011949215832713)
+	}
+	if diff := math.Abs(metrics.NetBps - 117.43788897186927); diff > 1e-9 {
+		t.Fatalf("net bps = %.12f, want %.12f", metrics.NetBps, 117.43788897186927)
+	}
+}
+
+func TestTrader_VerifyCloseLegUsesFetchFallback(t *testing.T) {
+	tr := newTestTraderWithPosition()
+	maker := tr.maker.(*testExchange)
+	maker.ordersByID = map[string]*exchanges.Order{
+		"maker-close": {
+			OrderID:        "maker-close",
+			Status:         exchanges.OrderStatusFilled,
+			Price:          decimal.RequireFromString("100.1"),
+			FilledQuantity: decimal.RequireFromString("0.001"),
+		},
+	}
+
+	prevTimeout := closeLegVerifyTimeout
+	closeLegVerifyTimeout = 10 * time.Millisecond
+	defer func() {
+		closeLegVerifyTimeout = prevTimeout
+	}()
+
+	ok, err := tr.verifyCloseLeg(context.Background(), &exchanges.Order{
+		OrderID: "maker-close",
+		Status:  exchanges.OrderStatusPending,
+	}, tr.makerOrderCh, tr.takerOrderCh, true)
+	if err != nil {
+		t.Fatalf("verifyCloseLeg error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatal("verifyCloseLeg = false, want true")
+	}
+}
+
+func TestTrader_VerifyCloseLegFailsWhenFetchCannotConfirm(t *testing.T) {
+	tr := newTestTraderWithPosition()
+	maker := tr.maker.(*testExchange)
+	maker.fetchOrderErr = errors.New("fetch failed")
+
+	prevTimeout := closeLegVerifyTimeout
+	closeLegVerifyTimeout = 10 * time.Millisecond
+	defer func() {
+		closeLegVerifyTimeout = prevTimeout
+	}()
+
+	ok, err := tr.verifyCloseLeg(context.Background(), &exchanges.Order{
+		OrderID: "maker-close",
+		Status:  exchanges.OrderStatusPending,
+	}, tr.makerOrderCh, tr.takerOrderCh, true)
+	if err == nil {
+		t.Fatal("verifyCloseLeg error = nil, want error")
+	}
+	if ok {
+		t.Fatal("verifyCloseLeg = true, want false")
 	}
 }

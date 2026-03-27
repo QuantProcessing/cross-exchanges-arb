@@ -89,6 +89,20 @@ func TestSpreadEngine_EmitSignalCallbackCanReenterEngine(t *testing.T) {
 	}
 }
 
+func TestSpreadEngine_RoundTripFeeBpsMatchesExecutionPath(t *testing.T) {
+	engine := &SpreadEngine{}
+	engine.SetFees(
+		FeeInfo{MakerRate: 0.0001, TakerRate: 0.0003},
+		FeeInfo{MakerRate: 0.0002, TakerRate: 0.0005},
+	)
+
+	got := engine.roundTripFeeBps()
+	want := (0.0001 + 0.0003 + 0.0005 + 0.0005) * 10000
+	if math.Abs(got-want) > 1e-12 {
+		t.Fatalf("roundTripFeeBps = %.12f, want %.12f", got, want)
+	}
+}
+
 func stableStats(samples []float64) (mean float64, stddev float64) {
 	if len(samples) == 0 {
 		return 0, 0

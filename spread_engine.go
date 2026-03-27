@@ -140,17 +140,17 @@ const (
 
 // SpreadSignal represents a detected arbitrage opportunity.
 type SpreadSignal struct {
-	Direction       SpreadDirection
-	SpreadBps       float64         // current spread in BPS
-	ZScore          float64         // Z-Score of the spread
-	Mean            float64         // current rolling mean (BPS)
-	StdDev          float64         // current rolling stddev (BPS)
-	ExpectedProfit  float64         // expected profit BPS (spread recovery to mean minus fees)
-	MakerBid        decimal.Decimal // maker exchange best bid
-	MakerAsk        decimal.Decimal // maker exchange best ask
-	TakerBid        decimal.Decimal // taker exchange best bid
-	TakerAsk        decimal.Decimal // taker exchange best ask
-	Timestamp       time.Time
+	Direction      SpreadDirection
+	SpreadBps      float64         // current spread in BPS
+	ZScore         float64         // Z-Score of the spread
+	Mean           float64         // current rolling mean (BPS)
+	StdDev         float64         // current rolling stddev (BPS)
+	ExpectedProfit float64         // expected profit BPS (spread recovery to mean minus fees)
+	MakerBid       decimal.Decimal // maker exchange best bid
+	MakerAsk       decimal.Decimal // maker exchange best ask
+	TakerBid       decimal.Decimal // taker exchange best bid
+	TakerAsk       decimal.Decimal // taker exchange best ask
+	Timestamp      time.Time
 }
 
 // --- Spread Engine ---
@@ -221,10 +221,11 @@ func (e *SpreadEngine) SetSignalCallback(cb func(signal *SpreadSignal)) {
 }
 
 // roundTripFeeBps calculates the total round-trip fee in BPS.
-// A round-trip involves 4 fee events: open on A + open on B + close on A + close on B.
-// Maker exchange pays maker fees, taker exchange pays taker fees.
+// A round-trip involves 4 fee events: maker open, taker hedge open, maker close,
+// and taker close. The current execution path opens on the maker exchange with a
+// maker order, then closes both sides with market orders.
 func (e *SpreadEngine) roundTripFeeBps() float64 {
-	return (e.makerFee.MakerRate + e.takerFee.TakerRate) * 2 * 10000
+	return (e.makerFee.MakerRate + e.makerFee.TakerRate + e.takerFee.TakerRate + e.takerFee.TakerRate) * 10000
 }
 
 // Start begins monitoring spread via WatchOrderBook on both exchanges.

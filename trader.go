@@ -15,11 +15,12 @@ import (
 
 // ArbPosition represents an open arbitrage position.
 type ArbPosition struct {
-	Direction    SpreadDirection
-	OpenSpread   float64 // spread BPS at open
-	OpenZScore   float64 // Z-Score at open
-	OpenTime     time.Time
-	OpenQuantity decimal.Decimal
+	Direction          SpreadDirection
+	OpenSpread         float64 // spread BPS at open
+	OpenZScore         float64 // Z-Score at open
+	OpenExpectedProfit float64 // modeled net profit BPS at open
+	OpenTime           time.Time
+	OpenQuantity       decimal.Decimal
 
 	// Order details (nil in dry-run)
 	LongOrder  *exchanges.Order
@@ -58,6 +59,8 @@ type Trader struct {
 	makerOrderCh chan *exchanges.Order
 	takerOrderCh chan *exchanges.Order
 }
+
+var closeLegVerifyTimeout = 5 * time.Second
 
 func (t *Trader) roundTag() string {
 	return fmt.Sprintf("R%03d", t.roundID)
@@ -196,11 +199,12 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 	if t.config.DryRun {
 		t.logger.Infof("%s 🔸 [DRY] open %s qty=%s", roundTag, sig.Direction, t.config.Quantity)
 		t.position = &ArbPosition{
-			Direction:    sig.Direction,
-			OpenSpread:   sig.SpreadBps,
-			OpenZScore:   sig.ZScore,
-			OpenTime:     now,
-			OpenQuantity: t.config.Quantity,
+			Direction:          sig.Direction,
+			OpenSpread:         sig.SpreadBps,
+			OpenZScore:         sig.ZScore,
+			OpenExpectedProfit: sig.ExpectedProfit,
+			OpenTime:           now,
+			OpenQuantity:       t.config.Quantity,
 		}
 		t.lastTrade = now
 		t.state = StatePositionOpen
@@ -397,6 +401,7 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 			return err
 		}
 		if order != nil {
+			mergeOrderDetails(flow.makerOrder, order)
 			filledQty = order.FilledQuantity
 			orderStatus = order.Status
 			t.logger.Infof("%s REST status=%s filled=%s", t.roundTag(), order.Status, filledQty)
@@ -479,6 +484,7 @@ func (t *Trader) handleMakerOrderUpdate(ctx context.Context, update *exchanges.O
 	if !t.matchesOpenMakerOrder(update, makerOrder, clientID) {
 		return false, nil
 	}
+	mergeOrderDetails(makerOrder, update)
 
 	flowQty := fallbackQty
 	t.mu.Lock()
@@ -619,6 +625,7 @@ func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order, expe
 			if update.OrderID != order.OrderID && update.ClientOrderID != order.ClientOrderID {
 				continue
 			}
+			mergeOrderDetails(order, update)
 			switch update.Status {
 			case exchanges.OrderStatusFilled:
 				t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
@@ -634,7 +641,13 @@ func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order, expe
 		case <-timeout:
 			// No WS event in 10s — verify via FetchPositions as fallback
 			t.logger.Warnf("%s taker fill timeout, checking positions...", t.roundTag())
-			return t.verifyTakerPosition(ctx, expectedDelta)
+			confirmed, err := t.verifyTakerPosition(ctx, expectedDelta)
+			if confirmed {
+				if snapshot, snapshotErr := t.fetchOrderSnapshot(ctx, t.taker, order); snapshotErr == nil {
+					mergeOrderDetails(order, snapshot)
+				}
+			}
+			return confirmed, err
 		case <-ctx.Done():
 			return false, ctx.Err()
 		}
@@ -689,20 +702,23 @@ func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal
 	}
 
 	longName, shortName := t.config.MakerExchange, t.config.TakerExchange
+	longOrder, shortOrder := makerOrder, flow.lastHedgeOrder
 	if flow.signal.Direction == LongTakerShortMaker {
 		longName, shortName = shortName, longName
+		longOrder, shortOrder = flow.lastHedgeOrder, makerOrder
 	}
 
 	t.position = &ArbPosition{
-		Direction:     flow.signal.Direction,
-		OpenSpread:    flow.signal.SpreadBps,
-		OpenZScore:    flow.signal.ZScore,
-		OpenTime:      time.Now(),
-		OpenQuantity:  filledQty,
-		LongOrder:     makerOrder,
-		ShortOrder:    flow.lastHedgeOrder,
-		LongExchange:  longName,
-		ShortExchange: shortName,
+		Direction:          flow.signal.Direction,
+		OpenSpread:         flow.signal.SpreadBps,
+		OpenZScore:         flow.signal.ZScore,
+		OpenExpectedProfit: flow.signal.ExpectedProfit,
+		OpenTime:           time.Now(),
+		OpenQuantity:       filledQty,
+		LongOrder:          longOrder,
+		ShortOrder:         shortOrder,
+		LongExchange:       longName,
+		ShortExchange:      shortName,
 	}
 	t.lastTrade = time.Now()
 	t.state = StatePositionOpen
@@ -987,6 +1003,10 @@ func (t *Trader) closePosition(reason string) {
 		return
 	}
 
+	longCloseOrder := t.refreshOrderForMetrics(ctx, longExchange, results["long"].order)
+	shortCloseOrder := t.refreshOrderForMetrics(ctx, shortExchange, results["short"].order)
+	t.logRealizedCloseMetrics(pos, longCloseOrder, shortCloseOrder)
+
 	t.finishSuccessfulClose()
 
 	t.logger.Infof("%s ✅ closed  %s  round=%d/%d (%dms)",
@@ -1003,11 +1023,29 @@ func (t *Trader) verifyCloseLeg(ctx context.Context, order *exchanges.Order, mak
 	}
 
 	ch := takerCh
+	exchange := t.taker
 	if useMaker {
 		ch = makerCh
+		exchange = t.maker
 	}
 
-	timeout := time.After(5 * time.Second)
+	_, err := t.confirmOrderFilled(ctx, exchange, order, ch, closeLegVerifyTimeout)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (t *Trader) confirmOrderFilled(ctx context.Context, exchange exchanges.Exchange, order *exchanges.Order, ch <-chan *exchanges.Order, timeout time.Duration) (*exchanges.Order, error) {
+	if order == nil {
+		return nil, fmt.Errorf("nil order")
+	}
+	if order.Status == exchanges.OrderStatusFilled {
+		return order, nil
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	for {
 		select {
 		case update := <-ch:
@@ -1017,16 +1055,31 @@ func (t *Trader) verifyCloseLeg(ctx context.Context, order *exchanges.Order, mak
 			if update.OrderID != order.OrderID && update.ClientOrderID != order.ClientOrderID {
 				continue
 			}
+			mergeOrderDetails(order, update)
 			if update.Status == exchanges.OrderStatusFilled {
-				return true, nil
+				return order, nil
 			}
 			if update.Status == exchanges.OrderStatusCancelled || update.Status == exchanges.OrderStatusRejected {
-				return false, fmt.Errorf("status=%s", update.Status)
+				return nil, fmt.Errorf("status=%s", update.Status)
 			}
-		case <-timeout:
-			return true, nil // timeout, assume success
+		case <-timer.C:
+			snapshot, err := t.fetchOrderSnapshot(ctx, exchange, order)
+			if err != nil {
+				return nil, err
+			}
+			if snapshot == nil {
+				return nil, fmt.Errorf("order %s not found after timeout", order.OrderID)
+			}
+			switch snapshot.Status {
+			case exchanges.OrderStatusFilled:
+				return snapshot, nil
+			case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
+				return nil, fmt.Errorf("status=%s", snapshot.Status)
+			default:
+				return nil, fmt.Errorf("status=%s filled=%s", snapshot.Status, snapshot.FilledQuantity)
+			}
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 }
@@ -1046,6 +1099,106 @@ func (t *Trader) finishSuccessfulClose() {
 			ctx = context.Background()
 		}
 		t.pnl.OnRoundComplete(ctx)
+	}
+}
+
+func (t *Trader) fetchOrderSnapshot(ctx context.Context, exchange exchanges.Exchange, order *exchanges.Order) (*exchanges.Order, error) {
+	if exchange == nil || order == nil || order.OrderID == "" {
+		return nil, nil
+	}
+	fetchCtx := ctx
+	if fetchCtx == nil || fetchCtx.Err() != nil {
+		fetchCtx = context.Background()
+	}
+	snapshotCtx, cancel := context.WithTimeout(fetchCtx, 5*time.Second)
+	defer cancel()
+	snapshot, err := exchange.FetchOrderByID(snapshotCtx, order.OrderID, t.config.Symbol)
+	if err != nil {
+		return nil, fmt.Errorf("fetch order %s: %w", order.OrderID, err)
+	}
+	mergeOrderDetails(order, snapshot)
+	return order, nil
+}
+
+func (t *Trader) refreshOrderForMetrics(ctx context.Context, exchange exchanges.Exchange, order *exchanges.Order) *exchanges.Order {
+	if order == nil {
+		return nil
+	}
+	if order.Price.GreaterThan(decimal.Zero) && order.Status == exchanges.OrderStatusFilled {
+		return order
+	}
+	snapshot, err := t.fetchOrderSnapshot(ctx, exchange, order)
+	if err != nil {
+		t.logger.Warnf("%s close order refresh failed %s: %v", t.roundTag(), order.OrderID, err)
+		return order
+	}
+	if snapshot != nil {
+		return snapshot
+	}
+	return order
+}
+
+func (t *Trader) logRealizedCloseMetrics(pos *ArbPosition, longCloseOrder, shortCloseOrder *exchanges.Order) {
+	if pos == nil {
+		return
+	}
+	var makerFee, takerFee FeeInfo
+	if t.engine != nil {
+		makerFee = t.engine.makerFee
+		takerFee = t.engine.takerFee
+	}
+	metrics, err := calculateRealizedProfitMetrics(pos, t.config, makerFee, takerFee, longCloseOrder, shortCloseOrder)
+	if err != nil {
+		t.logger.Warnf("%s ⚠️ realized bps unavailable: %v", t.roundTag(), err)
+		return
+	}
+
+	t.logger.Infof("%s 💹 realized  signal=%.1fbps entry=%.1fbps exit=%.1fbps gross=%.1fbps fee=%.1fbps net=%.1fbps",
+		t.roundTag(), pos.OpenExpectedProfit, metrics.EntryBps, metrics.ExitBps, metrics.GrossBps, metrics.FeeBps, metrics.NetBps)
+}
+
+func mergeOrderDetails(dst, src *exchanges.Order) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.OrderID == "" {
+		dst.OrderID = src.OrderID
+	}
+	if dst.ClientOrderID == "" {
+		dst.ClientOrderID = src.ClientOrderID
+	}
+	if dst.Symbol == "" {
+		dst.Symbol = src.Symbol
+	}
+	if dst.Side == "" {
+		dst.Side = src.Side
+	}
+	if dst.Type == "" {
+		dst.Type = src.Type
+	}
+	if dst.Quantity.IsZero() {
+		dst.Quantity = src.Quantity
+	}
+	if src.Price.GreaterThan(decimal.Zero) {
+		dst.Price = src.Price
+	}
+	if src.FilledQuantity.GreaterThan(decimal.Zero) {
+		dst.FilledQuantity = src.FilledQuantity
+	}
+	if src.Fee.GreaterThan(decimal.Zero) {
+		dst.Fee = src.Fee
+	}
+	if src.Status != "" {
+		dst.Status = src.Status
+	}
+	if dst.Timestamp == 0 {
+		dst.Timestamp = src.Timestamp
+	}
+	if src.ReduceOnly {
+		dst.ReduceOnly = true
+	}
+	if src.TimeInForce != "" {
+		dst.TimeInForce = src.TimeInForce
 	}
 }
 
