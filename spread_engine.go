@@ -118,7 +118,7 @@ func (s *SpreadStats) recomputeIfDirty() {
 		return
 	}
 
-	variance := m2 / float64(len(data))
+	variance := m2 / float64(len(data)-1) // Bessel's correction for sample variance
 	if variance < 0 {
 		variance = 0
 	}
@@ -327,9 +327,9 @@ func (e *SpreadEngine) onBBOUpdate() {
 		return
 	}
 
-	// Sanity check: skip if mid prices differ by > 50%
+	// Sanity check: skip if mid prices differ by > 5%
 	priceDiff, _ := makerMid.Sub(takerMid).Abs().Div(midPrice).Float64()
-	if priceDiff > 0.5 {
+	if priceDiff > 0.05 {
 		e.logger.Warnw("price divergence too large, skipping",
 			"makerMid", makerMid, "takerMid", takerMid, "diff", priceDiff)
 		return
@@ -358,18 +358,21 @@ func (e *SpreadEngine) onBBOUpdate() {
 	warmedUp := tickCount >= e.config.WarmupTicks &&
 		now.Sub(e.firstSeen) >= e.config.WarmupDuration
 
-	// Calculate Z-Scores
+	// Log warmup progress under lock (modifies e.warmupLogged)
+	if !warmedUp {
+		e.logWarmupMilestone(tickCount, now)
+	}
+
+	// Calculate Z-Scores and snapshot all stats under lock
 	zAB := e.statsAB.ZScore(spreadAB)
 	zBA := e.statsBA.ZScore(spreadBA)
-
-	// Snapshot stats values while still under lock
 	meanAB := e.statsAB.Mean()
 	stddevAB := e.statsAB.StdDev()
 	meanBA := e.statsBA.Mean()
 	stddevBA := e.statsBA.StdDev()
 	e.mu.Unlock()
 
-	// CSV output for observe-only mode
+	// CSV output for observe-only mode (outside lock)
 	if e.csvWriter != nil {
 		if err := e.csvWriter.Write([]string{
 			now.Format(time.RFC3339Nano),
@@ -381,12 +384,14 @@ func (e *SpreadEngine) onBBOUpdate() {
 		}); err != nil {
 			e.logger.Warnw("CSV write failed", "err", err)
 		}
+		// Flush CSV periodically to prevent data loss
+		if tickCount%100 == 0 {
+			e.csvWriter.Flush()
+		}
 	}
 
-	// Log periodic status
-	if !warmedUp {
-		e.logWarmupMilestone(tickCount, now)
-	} else if tickCount%200 == 0 {
+	// Log periodic status (outside lock)
+	if warmedUp && tickCount%200 == 0 {
 		e.logger.Infof("📈 AB=%.1fbps(Z=%.2f) BA=%.1fbps(Z=%.2f) μ=%.2f σ=%.2f",
 			spreadAB, zAB, spreadBA, zBA, meanAB, stddevAB)
 	}
@@ -396,7 +401,7 @@ func (e *SpreadEngine) onBBOUpdate() {
 		return
 	}
 
-	// Evaluate signals (use snapshotted stats values from above)
+	// Evaluate signals (outside lock, using snapshotted values)
 	fees := e.roundTripFeeBps()
 
 	// Check AB direction: Long maker, Short taker

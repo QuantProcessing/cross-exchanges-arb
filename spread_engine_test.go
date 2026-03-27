@@ -3,6 +3,10 @@ package main
 import (
 	"math"
 	"testing"
+	"time"
+
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 func TestSpreadStats_RollingWindowTracksCurrentSamples(t *testing.T) {
@@ -54,6 +58,37 @@ func TestSpreadStats_StdDevIsStableForLargeOffsets(t *testing.T) {
 	}
 }
 
+func TestSpreadEngine_EmitSignalCallbackCanReenterEngine(t *testing.T) {
+	cfg := &Config{
+		Symbol:         "BTC",
+		WindowSize:     10,
+		ZOpen:          -1,
+		MinProfitBps:   -1,
+		WarmupTicks:    1,
+		WarmupDuration: 0,
+	}
+
+	engine := NewSpreadEngine(nil, nil, cfg, zap.NewNop().Sugar())
+	engine.makerBid = decimal.RequireFromString("100")
+	engine.makerAsk = decimal.RequireFromString("101")
+	engine.takerBid = decimal.RequireFromString("102")
+	engine.takerAsk = decimal.RequireFromString("103")
+
+	done := make(chan struct{}, 1)
+	engine.SetSignalCallback(func(signal *SpreadSignal) {
+		engine.GetCurrentZ()
+		done <- struct{}{}
+	})
+
+	go engine.onBBOUpdate()
+
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("signal callback blocked while reentering engine")
+	}
+}
+
 func stableStats(samples []float64) (mean float64, stddev float64) {
 	if len(samples) == 0 {
 		return 0, 0
@@ -70,7 +105,7 @@ func stableStats(samples []float64) (mean float64, stddev float64) {
 		return mean, 0
 	}
 
-	variance := stddev / float64(len(samples))
+	variance := stddev / float64(len(samples)-1) // Bessel's correction for sample variance
 	if variance < 0 {
 		variance = 0
 	}

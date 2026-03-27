@@ -28,8 +28,11 @@ type PnLTracker struct {
 	currentMakerBal decimal.Decimal
 	currentTakerBal decimal.Decimal
 
-	lastRefresh time.Time
-	rounds      int
+	lastRefresh       time.Time
+	rounds            int
+	makerFetchFailed  bool
+	takerFetchFailed  bool
+	consecutiveFails  int
 }
 
 // NewPnLTracker creates a tracker and snapshots initial balances.
@@ -52,16 +55,34 @@ func (p *PnLTracker) refreshBalances(ctx context.Context) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	makerOk := false
+	takerOk := false
+
 	if bal, err := p.maker.FetchBalance(fetchCtx); err == nil {
 		p.currentMakerBal = bal
+		p.makerFetchFailed = false
+		makerOk = true
 	} else {
 		p.logger.Warnf("balance fetch failed %s: %v", p.makerName, err)
+		p.makerFetchFailed = true
 	}
 
 	if bal, err := p.taker.FetchBalance(fetchCtx); err == nil {
 		p.currentTakerBal = bal
+		p.takerFetchFailed = false
+		takerOk = true
 	} else {
 		p.logger.Warnf("balance fetch failed %s: %v", p.takerName, err)
+		p.takerFetchFailed = true
+	}
+
+	if !makerOk || !takerOk {
+		p.consecutiveFails++
+		if p.consecutiveFails >= 3 {
+			p.logger.Warnf("⚠️ balance fetch failed %d times - PnL may be stale", p.consecutiveFails)
+		}
+	} else {
+		p.consecutiveFails = 0
 	}
 
 	p.lastRefresh = time.Now()

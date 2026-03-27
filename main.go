@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	exchanges "github.com/QuantProcessing/exchanges"
 	_ "github.com/QuantProcessing/exchanges/decibel"
@@ -103,7 +104,9 @@ func main() {
 	engine.SetSignalCallback(trader.HandleSignal)
 
 	// Start trader monitoring
-	trader.Start(ctx)
+	if err := trader.Start(ctx); err != nil {
+		logger.Fatalw("failed to start trader", "err", err)
+	}
 
 	mode := "LIVE"
 	if cfg.DryRun {
@@ -121,6 +124,11 @@ func main() {
 	// Start spread engine (blocks until context done or error)
 	if err := engine.Start(ctx); err != nil && ctx.Err() == nil {
 		logger.Errorw("spread engine error", "err", err)
+	}
+
+	// Graceful shutdown: cancel orders, report open positions
+	if !cfg.ObserveOnly {
+		trader.GracefulShutdown(15 * time.Second)
 	}
 
 	go telegram.Notify(fmt.Sprintf("🛑 Cross-Arb Stopped\nRounds completed: %d", pnl.rounds))

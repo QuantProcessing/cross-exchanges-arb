@@ -100,7 +100,38 @@ func ParseConfig() *Config {
 		panic(fmt.Sprintf("invalid max-hold %q: %v", *maxHold, err))
 	}
 
+	// Validate config
+	if err := c.Validate(); err != nil {
+		panic(fmt.Sprintf("invalid config: %v", err))
+	}
+
 	return c
+}
+
+// Validate checks if the config is valid.
+func (c *Config) Validate() error {
+	if c.Quantity.LessThanOrEqual(decimal.Zero) {
+		return fmt.Errorf("quantity must be positive, got %s", c.Quantity)
+	}
+	if c.WindowSize < 10 {
+		return fmt.Errorf("window size must be >= 10, got %d", c.WindowSize)
+	}
+	if c.ZClose >= c.ZOpen {
+		return fmt.Errorf("z-close (%.2f) must be < z-open (%.2f)", c.ZClose, c.ZOpen)
+	}
+	if c.ZStop >= c.ZClose {
+		return fmt.Errorf("z-stop (%.2f) must be < z-close (%.2f)", c.ZStop, c.ZClose)
+	}
+	if c.Slippage < 0 || c.Slippage > 0.1 {
+		return fmt.Errorf("slippage must be between 0 and 0.1, got %.4f", c.Slippage)
+	}
+	if c.MakerTimeout < time.Second {
+		return fmt.Errorf("maker-timeout must be >= 1s, got %s", c.MakerTimeout)
+	}
+	if c.MaxRounds < 1 {
+		return fmt.Errorf("max-rounds must be >= 1, got %d", c.MaxRounds)
+	}
+	return nil
 }
 
 // String returns a formatted summary of the config for the startup dashboard.

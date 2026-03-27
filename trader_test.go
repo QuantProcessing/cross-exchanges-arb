@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,9 +19,12 @@ type testExchange struct {
 	name            string
 	symbolDetails   *exchanges.SymbolDetails
 	placedQtys      []decimal.Decimal
+	placedOrders    []*exchanges.OrderParams
 	cancelCalls     int
+	cancelAllCalls  int
 	lastCancelOrder string
 	forcePlaceErr   error
+	watchOrdersErr  error
 }
 
 func newTestExchange(name string) *testExchange {
@@ -59,6 +63,8 @@ func (e *testExchange) PlaceOrder(ctx context.Context, params *exchanges.OrderPa
 		return nil, e.forcePlaceErr
 	}
 	e.placedQtys = append(e.placedQtys, params.Quantity)
+	paramsCopy := *params
+	e.placedOrders = append(e.placedOrders, &paramsCopy)
 	return &exchanges.Order{
 		OrderID:        fmt.Sprintf("%s-%d", e.name, len(e.placedQtys)),
 		Symbol:         params.Symbol,
@@ -77,7 +83,12 @@ func (e *testExchange) CancelOrder(ctx context.Context, orderID, symbol string) 
 	e.lastCancelOrder = orderID
 	return nil
 }
-func (e *testExchange) CancelAllOrders(ctx context.Context, symbol string) error { return nil }
+func (e *testExchange) CancelAllOrders(ctx context.Context, symbol string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cancelAllCalls++
+	return nil
+}
 func (e *testExchange) FetchOrderByID(ctx context.Context, orderID, symbol string) (*exchanges.Order, error) {
 	return nil, nil
 }
@@ -103,6 +114,10 @@ func (e *testExchange) WatchOrderBook(ctx context.Context, symbol string, cb exc
 func (e *testExchange) GetLocalOrderBook(symbol string, depth int) *exchanges.OrderBook { return nil }
 func (e *testExchange) StopWatchOrderBook(ctx context.Context, symbol string) error     { return nil }
 func (e *testExchange) WatchOrders(ctx context.Context, cb exchanges.OrderUpdateCallback) error {
+	if e.watchOrdersErr != nil {
+		return e.watchOrdersErr
+	}
+	<-ctx.Done()
 	return nil
 }
 func (e *testExchange) WatchPositions(ctx context.Context, cb exchanges.PositionUpdateCallback) error {
@@ -460,5 +475,81 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 	}
 	if !takerQtys[1].Equal(decimal.RequireFromString("0.001")) {
 		t.Fatalf("close taker qty = %s, want 0.001", takerQtys[1])
+	}
+}
+
+func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
+	tr, maker, taker := newActiveFlowTrader()
+	tr.position = &ArbPosition{
+		Direction:    LongMakerShortTaker,
+		OpenTime:     time.Now().Add(-time.Minute),
+		OpenQuantity: decimal.RequireFromString("0.001"),
+		LongExchange: "maker",
+		ShortExchange:"taker",
+	}
+	tr.state = StatePositionOpen
+
+	tr.GracefulShutdown(2 * time.Second)
+
+	if tr.position != nil {
+		t.Fatal("position should be closed during graceful shutdown")
+	}
+	if tr.state != StateCooldown {
+		t.Fatalf("state = %s, want cooldown", tr.state)
+	}
+
+	maker.mu.Lock()
+	makerOrders := append([]*exchanges.OrderParams(nil), maker.placedOrders...)
+	makerCancelAll := maker.cancelAllCalls
+	maker.mu.Unlock()
+	taker.mu.Lock()
+	takerOrders := append([]*exchanges.OrderParams(nil), taker.placedOrders...)
+	takerCancelAll := taker.cancelAllCalls
+	taker.mu.Unlock()
+
+	if makerCancelAll != 1 {
+		t.Fatalf("maker cancel all calls = %d, want 1", makerCancelAll)
+	}
+	if takerCancelAll != 1 {
+		t.Fatalf("taker cancel all calls = %d, want 1", takerCancelAll)
+	}
+	if len(makerOrders) != 1 {
+		t.Fatalf("maker close orders = %d, want 1", len(makerOrders))
+	}
+	if len(takerOrders) != 1 {
+		t.Fatalf("taker close orders = %d, want 1", len(takerOrders))
+	}
+	if !makerOrders[0].ReduceOnly {
+		t.Fatal("maker shutdown close must be reduce-only")
+	}
+	if !takerOrders[0].ReduceOnly {
+		t.Fatal("taker shutdown close must be reduce-only")
+	}
+}
+
+func TestTrader_StartFailsWhenWatchOrdersSubscriptionFails(t *testing.T) {
+	tr, maker, _ := newActiveFlowTrader()
+	maker.watchOrdersErr = errors.New("watch orders auth failed")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := tr.Start(ctx)
+	if err == nil {
+		t.Fatal("expected start to fail")
+	}
+	if !strings.Contains(err.Error(), "maker") {
+		t.Fatalf("error = %v, want maker context", err)
+	}
+}
+
+func TestTrader_StartSucceedsWhenWatchOrdersStayActive(t *testing.T) {
+	tr := newTestTrader()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("start error = %v, want nil", err)
 	}
 }

@@ -83,21 +83,73 @@ func (t *Trader) SetPnLTracker(p *PnLTracker) {
 }
 
 // Start begins the trader's monitoring loops.
-func (t *Trader) Start(ctx context.Context) {
+func (t *Trader) Start(ctx context.Context) error {
 	t.ctx = ctx
 
 	// Subscribe to order updates for maker-taker fill tracking
 	if !t.config.DryRun {
-		go t.maker.WatchOrders(ctx, func(o *exchanges.Order) {
-			t.makerOrderCh <- o
-		})
-		go t.taker.WatchOrders(ctx, func(o *exchanges.Order) {
-			t.takerOrderCh <- o
-		})
+		watchErrCh := make(chan error, 2)
+		startWatch := func(name string, ex exchanges.Exchange, out chan *exchanges.Order) {
+			go func() {
+				err := ex.WatchOrders(ctx, func(o *exchanges.Order) {
+					select {
+					case out <- o:
+					case <-ctx.Done():
+					}
+				})
+				if ctx.Err() != nil {
+					return
+				}
+				if err == nil {
+					err = fmt.Errorf("%s WatchOrders exited unexpectedly", name)
+				} else {
+					err = fmt.Errorf("%s WatchOrders: %w", name, err)
+				}
+				select {
+				case watchErrCh <- err:
+				default:
+				}
+			}()
+		}
+
+		startWatch(t.config.MakerExchange, t.maker, t.makerOrderCh)
+		startWatch(t.config.TakerExchange, t.taker, t.takerOrderCh)
+
+		startupTimer := time.NewTimer(200 * time.Millisecond)
+		defer startupTimer.Stop()
+		select {
+		case err := <-watchErrCh:
+			return err
+		case <-startupTimer.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		go t.monitorWatchOrderErrors(ctx, watchErrCh)
 	}
 
 	// Position monitor loop (check close conditions periodically)
 	go t.monitorLoop(ctx)
+	return nil
+}
+
+func (t *Trader) monitorWatchOrderErrors(ctx context.Context, errCh <-chan error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-errCh:
+			if err == nil {
+				continue
+			}
+			t.logger.Errorf("❌ order stream failed: %v", err)
+			go telegram.Notify(fmt.Sprintf("🚨 Order stream failed — manual intervention required\nErr: %v", err))
+			t.mu.Lock()
+			t.state = StateManualIntervention
+			t.mu.Unlock()
+			return
+		}
+	}
 }
 
 type openFlowState struct {
@@ -122,8 +174,8 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 		return
 	}
 
-	now := time.Now()
 	t.mu.Lock()
+	now := time.Now()
 	if !t.canStartNextRoundLocked(now) {
 		t.mu.Unlock()
 		return
@@ -330,24 +382,38 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 	t.logger.Infof("%s 🔄 REST fallback for %s", t.roundTag(), flow.makerOrder.OrderID)
 
 	filledQty := decimal.Zero
+	var orderStatus exchanges.OrderStatus
 	if flow.makerOrder != nil {
 		restCtx, restCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		order, err := t.maker.FetchOrderByID(restCtx, flow.makerOrder.OrderID, t.config.Symbol)
 		restCancel()
 		if err != nil {
-			t.logger.Errorf("%s REST fallback failed: %v", t.roundTag(), err)
-			go telegram.Notify(fmt.Sprintf("⚠️ Maker order status unknown after timeout\nOrderID: %s\nErr: %v",
+			t.logger.Errorf("%s ❌ REST fallback failed, order status UNKNOWN: %v", t.roundTag(), err)
+			go telegram.Notify(fmt.Sprintf("🚨 Maker order status UNKNOWN after timeout — manual intervention required\nOrderID: %s\nErr: %v",
 				flow.makerOrder.OrderID, err))
-			t.resetOpenFlow(StateIdle)
+			t.mu.Lock()
+			t.state = StateManualIntervention
+			t.mu.Unlock()
 			return err
 		}
 		if order != nil {
 			filledQty = order.FilledQuantity
+			orderStatus = order.Status
 			t.logger.Infof("%s REST status=%s filled=%s", t.roundTag(), order.Status, filledQty)
 		}
 	}
 
-	// Step 4: If any quantity was filled, hedge it; otherwise go idle.
+	// Step 4: Handle partial fills - cancel remaining if still open
+	if filledQty.GreaterThan(decimal.Zero) && filledQty.LessThan(flow.makerQty) &&
+		orderStatus == exchanges.OrderStatusPartiallyFilled {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := t.maker.CancelOrder(cancelCtx, flow.makerOrder.OrderID, t.config.Symbol); err != nil {
+			t.logger.Warnf("%s partial fill cancel failed: %v", t.roundTag(), err)
+		}
+		cancel()
+	}
+
+	// Step 5: If any quantity was filled, hedge it; otherwise go idle.
 	if filledQty.GreaterThan(decimal.Zero) {
 		hedgeOrder, err := t.hedgeMakerDelta(ctx, flow.makerOrder, filledQty)
 		if err != nil {
@@ -500,7 +566,7 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 
 	// Verify taker order fill via WatchOrders channel.
 	// PlaceOrder returns Pending — we must confirm actual fill status.
-	if confirmed, verifyErr := t.waitTakerFill(ctx, hedgeOrder); !confirmed {
+	if confirmed, verifyErr := t.waitTakerFill(ctx, hedgeOrder, delta); !confirmed {
 		errMsg := fmt.Sprintf("taker order rejected/unfilled: %v", verifyErr)
 		t.logger.Errorf("%s ❌ hedge REJECTED — UNHEDGED qty=%s: %s", t.roundTag(), delta, errMsg)
 		go telegram.Notify(fmt.Sprintf("🚨 HEDGE REJECTED — UNHEDGED!\nQty: %s\n%s", delta, errMsg))
@@ -517,13 +583,13 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 	t.mu.Unlock()
 
 	if targetQty.LessThan(flow.makerQty) && makerOrder != nil {
-		go func(orderID string) {
-			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := t.maker.CancelOrder(cancelCtx, orderID, t.config.Symbol); err != nil {
-				t.logger.Warnf("%s partial cancel failed: %v", t.roundTag(), err)
-			}
-		}(makerOrder.OrderID)
+		// Cancel remaining maker order after partial fill
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := t.maker.CancelOrder(cancelCtx, makerOrder.OrderID, t.config.Symbol); err != nil {
+			t.logger.Warnf("%s partial cancel failed: %v", t.roundTag(), err)
+			// Don't block on cancel failure - monitor via WatchOrders
+		}
+		cancel()
 	}
 
 	t.mu.Lock()
@@ -537,12 +603,12 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 
 // waitTakerFill waits for taker order confirmation via WatchOrders.
 // Returns (true, nil) if filled, (false, err) if rejected/cancelled/timeout.
-func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order) (bool, error) {
+func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order, expectedDelta decimal.Decimal) (bool, error) {
 	if order == nil {
 		return false, fmt.Errorf("nil order")
 	}
 
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(10 * time.Second)
 	for {
 		select {
 		case update := <-t.takerOrderCh:
@@ -566,32 +632,49 @@ func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order) (boo
 				continue
 			}
 		case <-timeout:
-			// No WS event in 5s — verify via FetchPositions as fallback
+			// No WS event in 10s — verify via FetchPositions as fallback
 			t.logger.Warnf("%s taker fill timeout, checking positions...", t.roundTag())
-			return t.verifyTakerPosition(ctx)
+			return t.verifyTakerPosition(ctx, expectedDelta)
 		case <-ctx.Done():
 			return false, ctx.Err()
 		}
 	}
 }
 
-// verifyTakerPosition checks if taker exchange has the expected position.
-func (t *Trader) verifyTakerPosition(ctx context.Context) (bool, error) {
+// verifyTakerPosition checks if taker exchange has the expected position after this hedge.
+// expectedDelta is the quantity we just tried to hedge (not cumulative).
+func (t *Trader) verifyTakerPosition(ctx context.Context, expectedDelta decimal.Decimal) (bool, error) {
 	perp, ok := t.taker.(exchanges.PerpExchange)
 	if !ok {
 		// Can't verify — assume success
 		return true, nil
 	}
+
+	t.mu.Lock()
+	flow := t.openFlow
+	// Total expected position = previously hedged + this delta
+	totalExpected := expectedDelta
+	if flow != nil {
+		totalExpected = flow.hedgedQty.Add(expectedDelta)
+	}
+	t.mu.Unlock()
+
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	positions, err := perp.FetchPositions(checkCtx)
 	if err != nil {
-		return true, nil // can't verify, assume success
+		return false, fmt.Errorf("fetch positions failed: %w", err)
 	}
 	for _, p := range positions {
-		if strings.EqualFold(p.Symbol, t.config.Symbol) && !p.Quantity.IsZero() {
-			t.logger.Infof("%s ✅ taker position verified: %s %s", t.roundTag(), p.Side, p.Quantity.Abs())
-			return true, nil
+		if strings.EqualFold(p.Symbol, t.config.Symbol) {
+			absQty := p.Quantity.Abs()
+			if absQty.GreaterThanOrEqual(totalExpected) {
+				t.logger.Infof("%s ✅ taker position verified: %s %s (expected >=%s)",
+					t.roundTag(), p.Side, absQty, totalExpected)
+				return true, nil
+			}
+			// Position exists but too small
+			return false, fmt.Errorf("taker position %s < expected %s", absQty, totalExpected)
 		}
 	}
 	return false, fmt.Errorf("no taker position found after hedge")
@@ -760,7 +843,7 @@ func (t *Trader) closePosition(reason string) {
 	}
 
 	closeCtx := t.ctx
-	if closeCtx == nil {
+	if closeCtx == nil || closeCtx.Err() != nil {
 		closeCtx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(closeCtx, 30*time.Second)
@@ -779,7 +862,8 @@ func (t *Trader) closePosition(reason string) {
 		longExchange, shortExchange = t.taker, t.maker
 	}
 
-	// Close both sides concurrently (ReduceOnly)
+	// Close both sides concurrently with ReduceOnly to prevent accidental
+	// position reversal if recorded qty exceeds actual remaining position.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	type closeLegResult struct {
@@ -791,19 +875,27 @@ func (t *Trader) closePosition(reason string) {
 
 	go func() {
 		defer wg.Done()
-		order, err := exchanges.PlaceMarketOrderWithSlippage(
-			ctx, longExchange, t.config.Symbol,
-			exchanges.OrderSideSell, qty, slippage,
-		)
+		order, err := longExchange.PlaceOrder(ctx, &exchanges.OrderParams{
+			Symbol:     t.config.Symbol,
+			Side:       exchanges.OrderSideSell,
+			Type:       exchanges.OrderTypeMarket,
+			Quantity:   qty,
+			Slippage:   slippage,
+			ReduceOnly: true,
+		})
 		errCh <- closeLegResult{leg: "long", order: order, err: err}
 	}()
 
 	go func() {
 		defer wg.Done()
-		order, err := exchanges.PlaceMarketOrderWithSlippage(
-			ctx, shortExchange, t.config.Symbol,
-			exchanges.OrderSideBuy, qty, slippage,
-		)
+		order, err := shortExchange.PlaceOrder(ctx, &exchanges.OrderParams{
+			Symbol:     t.config.Symbol,
+			Side:       exchanges.OrderSideBuy,
+			Type:       exchanges.OrderTypeMarket,
+			Quantity:   qty,
+			Slippage:   slippage,
+			ReduceOnly: true,
+		})
 		errCh <- closeLegResult{leg: "short", order: order, err: err}
 	}()
 
@@ -840,15 +932,30 @@ func (t *Trader) closePosition(reason string) {
 			} else {
 				exchange, side = shortExchange, exchanges.OrderSideBuy
 			}
-			retryOrder, retryErr := exchanges.PlaceMarketOrderWithSlippage(
-				retryCtx, exchange, t.config.Symbol, side, qty, slippage,
-			)
+			retryOrder, retryErr := exchange.PlaceOrder(retryCtx, &exchanges.OrderParams{
+				Symbol:     t.config.Symbol,
+				Side:       side,
+				Type:       exchanges.OrderTypeMarket,
+				Quantity:   qty,
+				Slippage:   slippage,
+				ReduceOnly: true,
+			})
 			if retryErr != nil {
 				t.logger.Errorf("%s ❌ %s leg retry: %v", t.roundTag(), leg, retryErr)
 				failures = append(failures, fmt.Sprintf("%s leg (retry): %v", leg, retryErr))
 			} else {
 				t.logger.Infof("%s ✅ %s leg retry ok", t.roundTag(), leg)
 				results[leg] = closeLegResult{leg: leg, order: retryOrder}
+				// Verify retry via WatchOrders for the leg
+				if leg == "long" {
+					if confirmed, _ := t.verifyCloseLeg(retryCtx, retryOrder, t.makerOrderCh, t.takerOrderCh, pos.Direction == LongMakerShortTaker); !confirmed {
+						failures = append(failures, fmt.Sprintf("%s leg retry unconfirmed", leg))
+					}
+				} else {
+					if confirmed, _ := t.verifyCloseLeg(retryCtx, retryOrder, t.makerOrderCh, t.takerOrderCh, pos.Direction == LongTakerShortMaker); !confirmed {
+						failures = append(failures, fmt.Sprintf("%s leg retry unconfirmed", leg))
+					}
+				}
 			}
 		}
 	}
@@ -887,6 +994,41 @@ func (t *Trader) closePosition(reason string) {
 		time.Since(closeStart).Milliseconds())
 	go telegram.Notify(fmt.Sprintf("🔴 %s Closed\n%s\nHeld: %s",
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second)))
+}
+
+// verifyCloseLeg verifies a close leg order via WatchOrders channel.
+func (t *Trader) verifyCloseLeg(ctx context.Context, order *exchanges.Order, makerCh, takerCh chan *exchanges.Order, useMaker bool) (bool, error) {
+	if order == nil {
+		return false, fmt.Errorf("nil order")
+	}
+
+	ch := takerCh
+	if useMaker {
+		ch = makerCh
+	}
+
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case update := <-ch:
+			if update == nil {
+				continue
+			}
+			if update.OrderID != order.OrderID && update.ClientOrderID != order.ClientOrderID {
+				continue
+			}
+			if update.Status == exchanges.OrderStatusFilled {
+				return true, nil
+			}
+			if update.Status == exchanges.OrderStatusCancelled || update.Status == exchanges.OrderStatusRejected {
+				return false, fmt.Errorf("status=%s", update.Status)
+			}
+		case <-timeout:
+			return true, nil // timeout, assume success
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 }
 
 func (t *Trader) finishSuccessfulClose() {
@@ -938,4 +1080,98 @@ func (t *Trader) HasPosition() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.position != nil
+}
+
+// GracefulShutdown cancels pending maker orders and alerts about open positions.
+// Called after the parent context is cancelled, uses a fresh context with deadline
+// so exchange API calls are not immediately rejected.
+func (t *Trader) GracefulShutdown(timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	t.mu.Lock()
+	state := t.state
+	flow := t.openFlow
+	pos := t.position
+	t.mu.Unlock()
+
+	t.logger.Infof("🛑 graceful shutdown: state=%s hasPosition=%v hasOpenFlow=%v", state, pos != nil, flow != nil)
+
+	// Step 1: Cancel any pending maker order
+	if flow != nil && flow.makerOrder != nil {
+		t.logger.Infof("🛑 cancelling pending maker order %s", flow.makerOrder.OrderID)
+		if err := t.maker.CancelOrder(ctx, flow.makerOrder.OrderID, t.config.Symbol); err != nil {
+			t.logger.Warnf("🛑 maker cancel failed: %v", err)
+		} else {
+			t.logger.Infof("🛑 maker order cancelled")
+		}
+	}
+
+	// Step 2: Belt-and-suspenders — cancel ALL open orders on both exchanges
+	if !t.config.DryRun {
+		t.cancelAllOpenOrders(ctx)
+	}
+
+	// Step 3: Close any open position using a fresh shutdown-safe context.
+	if pos != nil {
+		t.logger.Warnf("🛑 shutdown with open position, attempting forced close")
+		t.closePosition("shutdown signal")
+		t.mu.Lock()
+		pos = t.position
+		state = t.state
+		t.mu.Unlock()
+		if pos != nil {
+			msg := fmt.Sprintf("🛑 SHUTDOWN with OPEN POSITION\n"+
+				"Direction: %s\nQty: %s\nLong: %s / Short: %s\n"+
+				"Opened: %s ago\nSpread: %.1f bps\nState: %s\n\n"+
+				"⚠️ Auto-close failed — manual intervention required!",
+				pos.Direction, pos.OpenQuantity,
+				pos.LongExchange, pos.ShortExchange,
+				time.Since(pos.OpenTime).Round(time.Second),
+				pos.OpenSpread, state)
+			t.logger.Errorf(msg)
+			telegram.Notify(msg) // synchronous — we're shutting down
+		} else {
+			t.logger.Infof("🛑 shutdown position close succeeded")
+		}
+	}
+
+	// Step 4: Report in-flight open flow
+	if flow != nil && IsOpenFlowState(state) {
+		// Check if maker order was partially filled
+		filledQty := decimal.Zero
+		if flow.makerOrder != nil {
+			order, err := t.maker.FetchOrderByID(ctx, flow.makerOrder.OrderID, t.config.Symbol)
+			if err == nil && order != nil {
+				filledQty = order.FilledQuantity
+			}
+		}
+		if filledQty.GreaterThan(decimal.Zero) {
+			msg := fmt.Sprintf("🛑 SHUTDOWN with PARTIALLY FILLED maker order\n"+
+				"OrderID: %s\nFilled: %s / %s\nHedged: %s\n\n"+
+				"⚠️ Manual intervention required — possible unhedged exposure!",
+				flow.makerOrder.OrderID, filledQty, flow.makerQty, flow.hedgedQty)
+			t.logger.Errorf(msg)
+			telegram.Notify(msg)
+		}
+	}
+
+	t.logger.Infof("🛑 graceful shutdown complete")
+}
+
+// cancelAllOpenOrders cancels all open orders on both exchanges as a safety measure.
+func (t *Trader) cancelAllOpenOrders(ctx context.Context) {
+	for _, pair := range []struct {
+		name string
+		ex   exchanges.Exchange
+	}{
+		{t.config.MakerExchange, t.maker},
+		{t.config.TakerExchange, t.taker},
+	} {
+		if err := pair.ex.CancelAllOrders(ctx, t.config.Symbol); err != nil {
+			t.logger.Warnf("🛑 cancel all orders on %s failed: %v", pair.name, err)
+		} else {
+			t.logger.Infof("🛑 cancelled all orders on %s", pair.name)
+		}
+	}
 }
