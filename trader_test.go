@@ -16,19 +16,20 @@ import (
 )
 
 type testExchange struct {
-	mu              sync.Mutex
-	name            string
-	symbolDetails   *exchanges.SymbolDetails
-	placedQtys      []decimal.Decimal
-	placedOrders    []*exchanges.OrderParams
-	cancelCalls     int
-	cancelAllCalls  int
-	lastCancelOrder string
-	forcePlaceErr   error
-	watchOrdersErr  error
-	queuedOrders    []*exchanges.Order
-	ordersByID      map[string]*exchanges.Order
-	fetchOrderErr   error
+	mu               sync.Mutex
+	name             string
+	symbolDetails    *exchanges.SymbolDetails
+	placedQtys       []decimal.Decimal
+	placedOrders     []*exchanges.OrderParams
+	cancelCalls      int
+	cancelAllCalls   int
+	lastCancelOrder  string
+	forcePlaceErr    error
+	watchOrdersErr   error
+	watchOrdersAsync bool
+	queuedOrders     []*exchanges.Order
+	ordersByID       map[string]*exchanges.Order
+	fetchOrderErr    error
 }
 
 func newTestExchange(name string) *testExchange {
@@ -161,6 +162,9 @@ func (e *testExchange) StopWatchOrderBook(ctx context.Context, symbol string) er
 func (e *testExchange) WatchOrders(ctx context.Context, cb exchanges.OrderUpdateCallback) error {
 	if e.watchOrdersErr != nil {
 		return e.watchOrdersErr
+	}
+	if e.watchOrdersAsync {
+		return nil
 	}
 	<-ctx.Done()
 	return nil
@@ -601,6 +605,19 @@ func TestTrader_StartFailsWhenWatchOrdersSubscriptionFails(t *testing.T) {
 
 func TestTrader_StartSucceedsWhenWatchOrdersStayActive(t *testing.T) {
 	tr := newTestTrader()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("start error = %v, want nil", err)
+	}
+}
+
+func TestTrader_StartSucceedsWhenWatchOrdersRegistersAsync(t *testing.T) {
+	tr, maker, taker := newActiveFlowTrader()
+	maker.watchOrdersAsync = true
+	taker.watchOrdersAsync = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

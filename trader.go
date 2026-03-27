@@ -104,10 +104,13 @@ func (t *Trader) Start(ctx context.Context) error {
 					return
 				}
 				if err == nil {
-					err = fmt.Errorf("%s WatchOrders exited unexpectedly", name)
-				} else {
-					err = fmt.Errorf("%s WatchOrders: %w", name, err)
+					// Some adapters register the subscription asynchronously and
+					// return nil immediately instead of blocking for stream lifetime.
+					// Treat that as a successful startup rather than a fatal error.
+					t.logger.Debugf("%s WatchOrders registered in async mode", name)
+					return
 				}
+				err = fmt.Errorf("%s WatchOrders: %w", name, err)
 				select {
 				case watchErrCh <- err:
 				default:
