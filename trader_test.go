@@ -397,6 +397,15 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 	}
 
 	waitForTraderState(t, tr, StateWaitingFill)
+	// Maker partial fill triggers hedge → waitTakerFill reads from takerOrderCh
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		tr.takerOrderCh <- &exchanges.Order{
+			OrderID:        "taker-1",
+			Status:         exchanges.OrderStatusFilled,
+			FilledQuantity: decimal.RequireFromString("0.001"),
+		}
+	}()
 	tr.makerOrderCh <- &exchanges.Order{
 		OrderID:        "maker-1",
 		ClientOrderID:  "cid-1",
@@ -406,6 +415,15 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 	waitForTraderState(t, tr, StateWaitingFill)
 	waitForTraderState(t, tr, StateClosing)
 
+	// Maker cancel with fills also triggers hedge → provide taker fill
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		tr.takerOrderCh <- &exchanges.Order{
+			OrderID:        "taker-2",
+			Status:         exchanges.OrderStatusFilled,
+			FilledQuantity: decimal.RequireFromString("0.001"),
+		}
+	}()
 	tr.makerOrderCh <- &exchanges.Order{
 		OrderID:        "maker-1",
 		ClientOrderID:  "cid-1",

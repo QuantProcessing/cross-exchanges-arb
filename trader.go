@@ -498,6 +498,18 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 		return nil, err
 	}
 
+	// Verify taker order fill via WatchOrders channel.
+	// PlaceOrder returns Pending — we must confirm actual fill status.
+	if confirmed, verifyErr := t.waitTakerFill(ctx, hedgeOrder); !confirmed {
+		errMsg := fmt.Sprintf("taker order rejected/unfilled: %v", verifyErr)
+		t.logger.Errorf("%s ❌ hedge REJECTED — UNHEDGED qty=%s: %s", t.roundTag(), delta, errMsg)
+		go telegram.Notify(fmt.Sprintf("🚨 HEDGE REJECTED — UNHEDGED!\nQty: %s\n%s", delta, errMsg))
+		t.mu.Lock()
+		t.state = StateManualIntervention
+		t.mu.Unlock()
+		return nil, fmt.Errorf("%s", errMsg)
+	}
+
 	t.mu.Lock()
 	if t.openFlow != nil && targetQty.GreaterThan(t.openFlow.hedgedQty) {
 		t.openFlow.hedgedQty = targetQty
@@ -521,6 +533,68 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 	t.mu.Unlock()
 
 	return hedgeOrder, nil
+}
+
+// waitTakerFill waits for taker order confirmation via WatchOrders.
+// Returns (true, nil) if filled, (false, err) if rejected/cancelled/timeout.
+func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order) (bool, error) {
+	if order == nil {
+		return false, fmt.Errorf("nil order")
+	}
+
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case update := <-t.takerOrderCh:
+			if update == nil {
+				continue
+			}
+			// Match by OrderID or ClientOrderID
+			if update.OrderID != order.OrderID && update.ClientOrderID != order.ClientOrderID {
+				continue
+			}
+			switch update.Status {
+			case exchanges.OrderStatusFilled:
+				t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
+				return true, nil
+			case exchanges.OrderStatusPartiallyFilled:
+				// Keep waiting for full fill or terminal status
+				continue
+			case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
+				return false, fmt.Errorf("status=%s", update.Status)
+			default:
+				continue
+			}
+		case <-timeout:
+			// No WS event in 5s — verify via FetchPositions as fallback
+			t.logger.Warnf("%s taker fill timeout, checking positions...", t.roundTag())
+			return t.verifyTakerPosition(ctx)
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
+// verifyTakerPosition checks if taker exchange has the expected position.
+func (t *Trader) verifyTakerPosition(ctx context.Context) (bool, error) {
+	perp, ok := t.taker.(exchanges.PerpExchange)
+	if !ok {
+		// Can't verify — assume success
+		return true, nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	positions, err := perp.FetchPositions(checkCtx)
+	if err != nil {
+		return true, nil // can't verify, assume success
+	}
+	for _, p := range positions {
+		if strings.EqualFold(p.Symbol, t.config.Symbol) && !p.Quantity.IsZero() {
+			t.logger.Infof("%s ✅ taker position verified: %s %s", t.roundTag(), p.Side, p.Quantity.Abs())
+			return true, nil
+		}
+	}
+	return false, fmt.Errorf("no taker position found after hedge")
 }
 
 func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal.Decimal) {
