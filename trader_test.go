@@ -305,6 +305,20 @@ func waitForMakerOrders(t *testing.T, maker *testExchange, want int) {
 	t.Fatalf("maker order count = %d, want %d", got, want)
 }
 
+func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, msg string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatal(msg)
+}
+
 func TestTrader_MakerTimeoutWithNoFillsReturnsToIdle(t *testing.T) {
 	tr, _, _ := newActiveFlowTrader()
 
@@ -317,6 +331,92 @@ func TestTrader_MakerTimeoutWithNoFillsReturnsToIdle(t *testing.T) {
 	if tr.openFlow != nil {
 		t.Fatal("openFlow should be nil after no-fill timeout")
 	}
+}
+
+func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
+	tr, maker, taker := newActiveFlowTrader()
+	tr.config.MakerTimeout = 2 * time.Second
+	tr.config.MinProfitBps = 1.0
+	tr.engine = NewSpreadEngine(maker, taker, tr.config, zap.NewNop().Sugar())
+	tr.engine.statsAB.Add(0)
+	tr.engine.statsBA.Add(0)
+	tr.engine.makerBid = decimal.RequireFromString("100")
+	tr.engine.makerAsk = decimal.RequireFromString("100.10")
+	tr.engine.takerBid = decimal.RequireFromString("99.90")
+	tr.engine.takerAsk = decimal.RequireFromString("100.00")
+
+	sig := &SpreadSignal{
+		Direction:      LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99.95"),
+		TakerBid:       decimal.RequireFromString("100.15"),
+		TakerAsk:       decimal.RequireFromString("100.20"),
+	}
+
+	tr.HandleSignal(sig)
+
+	waitForCondition(t, 400*time.Millisecond, func() bool {
+		maker.mu.Lock()
+		defer maker.mu.Unlock()
+		return maker.cancelCalls > 0
+	}, "expected stale maker order to be cancelled before maker-timeout")
+
+	tr.makerOrderCh <- &exchanges.Order{
+		OrderID:        "maker-1",
+		ClientOrderID:  "cid-1",
+		Status:         exchanges.OrderStatusCancelled,
+		FilledQuantity: decimal.Zero,
+	}
+
+	waitForTraderState(t, tr, StateIdle)
+	if tr.openFlow != nil {
+		t.Fatal("openFlow should be cleared after stale maker cancel")
+	}
+
+	taker.mu.Lock()
+	defer taker.mu.Unlock()
+	if len(taker.placedQtys) != 0 {
+		t.Fatalf("taker hedge orders = %d, want 0", len(taker.placedQtys))
+	}
+}
+
+func TestTrader_CancelsPendingMakerOnImmediateMarketUpdate(t *testing.T) {
+	tr, maker, taker := newActiveFlowTrader()
+	tr.config.MakerTimeout = 2 * time.Second
+	tr.config.MinProfitBps = 1.0
+	tr.engine = NewSpreadEngine(maker, taker, tr.config, zap.NewNop().Sugar())
+	tr.engine.statsAB.Add(0)
+	tr.engine.statsBA.Add(0)
+
+	sig := &SpreadSignal{
+		Direction:      LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99.95"),
+		TakerBid:       decimal.RequireFromString("100.15"),
+		TakerAsk:       decimal.RequireFromString("100.20"),
+	}
+
+	tr.HandleSignal(sig)
+	waitForTraderState(t, tr, StateWaitingFill)
+
+	tr.engine.makerBid = decimal.RequireFromString("100")
+	tr.engine.makerAsk = decimal.RequireFromString("100.10")
+	tr.engine.takerBid = decimal.RequireFromString("99.90")
+	tr.engine.takerAsk = decimal.RequireFromString("100.00")
+
+	tr.engine.emitMarketUpdate()
+
+	waitForCondition(t, 80*time.Millisecond, func() bool {
+		maker.mu.Lock()
+		defer maker.mu.Unlock()
+		return maker.cancelCalls > 0
+	}, "expected stale maker order to be cancelled immediately after market update")
 }
 
 func TestTrader_HedgeFailureMovesToManualIntervention(t *testing.T) {

@@ -153,6 +153,16 @@ type SpreadSignal struct {
 	Timestamp      time.Time
 }
 
+// SpreadSnapshot captures the current top-of-book and rolling spread statistics.
+type SpreadSnapshot struct {
+	MakerBid decimal.Decimal
+	MakerAsk decimal.Decimal
+	TakerBid decimal.Decimal
+	TakerAsk decimal.Decimal
+	MeanAB   float64
+	MeanBA   float64
+}
+
 // --- Spread Engine ---
 
 // SpreadEngine monitors BBO from two exchanges and detects arbitrage signals.
@@ -183,7 +193,8 @@ type SpreadEngine struct {
 	takerFee FeeInfo
 
 	// Signal callback
-	onSignal func(signal *SpreadSignal)
+	onSignal       func(signal *SpreadSignal)
+	onMarketUpdate func()
 
 	// CSV writer for observe-only mode
 	csvWriter *csv.Writer
@@ -218,6 +229,11 @@ func (e *SpreadEngine) SetFees(makerFee, takerFee FeeInfo) {
 // SetSignalCallback sets the callback for when a signal is detected.
 func (e *SpreadEngine) SetSignalCallback(cb func(signal *SpreadSignal)) {
 	e.onSignal = cb
+}
+
+// SetMarketUpdateCallback sets the callback for any top-of-book update.
+func (e *SpreadEngine) SetMarketUpdateCallback(cb func()) {
+	e.onMarketUpdate = cb
 }
 
 // roundTripFeeBps calculates the total round-trip fee in BPS.
@@ -374,6 +390,7 @@ func (e *SpreadEngine) onBBOUpdate() {
 	e.mu.Unlock()
 
 	// CSV output for observe-only mode (outside lock)
+	e.emitMarketUpdate()
 	if e.csvWriter != nil {
 		if err := e.csvWriter.Write([]string{
 			now.Format(time.RFC3339Nano),
@@ -449,6 +466,40 @@ func (e *SpreadEngine) onBBOUpdate() {
 func (e *SpreadEngine) emitSignal(sig *SpreadSignal) {
 	if e.onSignal != nil {
 		e.onSignal(sig)
+	}
+}
+
+func (e *SpreadEngine) emitMarketUpdate() {
+	if e.onMarketUpdate != nil {
+		e.onMarketUpdate()
+	}
+}
+
+// Snapshot returns the latest top-of-book data and rolling means.
+func (e *SpreadEngine) Snapshot() *SpreadSnapshot {
+	if e == nil {
+		return nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	meanAB := 0.0
+	if e.statsAB != nil {
+		meanAB = e.statsAB.Mean()
+	}
+	meanBA := 0.0
+	if e.statsBA != nil {
+		meanBA = e.statsBA.Mean()
+	}
+
+	return &SpreadSnapshot{
+		MakerBid: e.makerBid,
+		MakerAsk: e.makerAsk,
+		TakerBid: e.takerBid,
+		TakerAsk: e.takerAsk,
+		MeanAB:   meanAB,
+		MeanBA:   meanBA,
 	}
 }
 

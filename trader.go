@@ -58,6 +58,7 @@ type Trader struct {
 	// For maker-taker mode: order update channel
 	makerOrderCh chan *exchanges.Order
 	takerOrderCh chan *exchanges.Order
+	marketUpdateCh chan struct{}
 }
 
 var closeLegVerifyTimeout = 5 * time.Second
@@ -68,7 +69,7 @@ func (t *Trader) roundTag() string {
 
 // NewTrader creates a new trader.
 func NewTrader(maker, taker exchanges.Exchange, engine *SpreadEngine, cfg *Config, logger *zap.SugaredLogger) *Trader {
-	return &Trader{
+	tr := &Trader{
 		maker:        maker,
 		taker:        taker,
 		engine:       engine,
@@ -76,8 +77,13 @@ func NewTrader(maker, taker exchanges.Exchange, engine *SpreadEngine, cfg *Confi
 		logger:       logger,
 		makerOrderCh: make(chan *exchanges.Order, 100),
 		takerOrderCh: make(chan *exchanges.Order, 100),
+		marketUpdateCh: make(chan struct{}, 1),
 		state:        StateIdle,
 	}
+	if engine != nil {
+		engine.SetMarketUpdateCallback(tr.notifyMarketUpdate)
+	}
+	return tr
 }
 
 // SetPnLTracker attaches a PnL tracker to the trader.
@@ -161,6 +167,7 @@ func (t *Trader) monitorWatchOrderErrors(ctx context.Context, errCh <-chan error
 type openFlowState struct {
 	signal         *SpreadSignal
 	makerOrder     *exchanges.Order
+	makerPrice     decimal.Decimal
 	makerSide      exchanges.OrderSide
 	takerSide      exchanges.OrderSide
 	makerQty       decimal.Decimal
@@ -179,6 +186,7 @@ func (t *Trader) HandleSignal(sig *SpreadSignal) {
 	if sig == nil {
 		return
 	}
+	t.ensureMarketUpdateNotifications()
 
 	t.mu.Lock()
 	now := time.Now()
@@ -292,6 +300,7 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal, signalTime time.Time) {
 	t.openFlow = &openFlowState{
 		signal:        sig,
 		makerOrder:    makerOrder,
+		makerPrice:    makerPrice,
 		makerSide:     makerSide,
 		takerSide:     takerSide,
 		makerQty:      qty,
@@ -308,6 +317,14 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal, signalTime time.Time) {
 	// Wait for maker fill with timeout.
 	timeout := time.NewTimer(t.config.MakerTimeout)
 	defer timeout.Stop()
+	marketUpdateCh := t.ensureMarketUpdateNotifications()
+
+	if cancel, reason := t.shouldCancelPendingMaker(); cancel {
+		if err := t.cancelPendingMaker(ctx, reason); err != nil {
+			t.logger.Warnf("%s stale maker cancel failed: %v", t.roundTag(), err)
+		}
+		return
+	}
 
 	for {
 		select {
@@ -323,6 +340,13 @@ func (t *Trader) openMakerTaker(sig *SpreadSignal, signalTime time.Time) {
 				t.logger.Warnf("%s timeout handling failed: %v", t.roundTag(), err)
 			}
 			return
+		case <-marketUpdateCh:
+			if cancel, reason := t.shouldCancelPendingMaker(); cancel {
+				if err := t.cancelPendingMaker(ctx, reason); err != nil {
+					t.logger.Warnf("%s stale maker cancel failed: %v", t.roundTag(), err)
+				}
+				return
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -356,6 +380,10 @@ func (t *Trader) hedgeMakerQty(ctx context.Context, filledQty decimal.Decimal) e
 }
 
 func (t *Trader) handleMakerTimeout(ctx context.Context) error {
+	return t.cancelPendingMaker(ctx, "maker-timeout reached")
+}
+
+func (t *Trader) cancelPendingMaker(ctx context.Context, reason string) error {
 	t.mu.Lock()
 	flow := t.openFlow
 	if flow == nil {
@@ -366,7 +394,7 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 	t.state = StateClosing
 	t.mu.Unlock()
 
-	t.logger.Infof("%s ⏰ timeout, cancelling order %s", t.roundTag(), flow.makerOrder.OrderID)
+	t.logger.Infof("%s 📴 cancelling maker order %s: %s", t.roundTag(), flow.makerOrder.OrderID, reason)
 
 	// Step 1: Cancel the maker order.
 	if flow.makerOrder != nil {
@@ -441,6 +469,88 @@ func (t *Trader) handleMakerTimeout(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (t *Trader) ensureMarketUpdateNotifications() chan struct{} {
+	t.mu.Lock()
+	if t.marketUpdateCh == nil {
+		t.marketUpdateCh = make(chan struct{}, 1)
+	}
+	ch := t.marketUpdateCh
+	t.mu.Unlock()
+
+	if t.engine != nil {
+		t.engine.SetMarketUpdateCallback(t.notifyMarketUpdate)
+	}
+	return ch
+}
+
+func (t *Trader) notifyMarketUpdate() {
+	ch := t.ensureMarketUpdateNotifications()
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (t *Trader) shouldCancelPendingMaker() (bool, string) {
+	t.mu.Lock()
+	flow := t.openFlow
+	if flow == nil || t.state != StateWaitingFill {
+		t.mu.Unlock()
+		return false, ""
+	}
+	makerPrice := flow.makerPrice
+	makerSide := flow.makerSide
+	t.mu.Unlock()
+
+	if t.engine == nil {
+		return false, ""
+	}
+	snapshot := t.engine.Snapshot()
+	if snapshot == nil || makerPrice.IsZero() {
+		return false, ""
+	}
+
+	var (
+		currentSpreadBps float64
+		meanSpreadBps    float64
+	)
+	switch makerSide {
+	case exchanges.OrderSideBuy:
+		if snapshot.TakerBid.IsZero() {
+			return false, ""
+		}
+		midPrice := makerPrice.Add(snapshot.TakerBid).Div(decimal.NewFromInt(2))
+		if midPrice.IsZero() {
+			return false, ""
+		}
+		currentSpreadBps, _ = snapshot.TakerBid.Sub(makerPrice).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
+		meanSpreadBps = snapshot.MeanAB
+	case exchanges.OrderSideSell:
+		if snapshot.TakerAsk.IsZero() {
+			return false, ""
+		}
+		midPrice := makerPrice.Add(snapshot.TakerAsk).Div(decimal.NewFromInt(2))
+		if midPrice.IsZero() {
+			return false, ""
+		}
+		currentSpreadBps, _ = makerPrice.Sub(snapshot.TakerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
+		meanSpreadBps = snapshot.MeanBA
+	default:
+		return false, ""
+	}
+
+	requiredEdge := t.engine.roundTripFeeBps() + t.config.MinProfitBps
+	expectedGrossProfit := currentSpreadBps - meanSpreadBps
+	if expectedGrossProfit > requiredEdge {
+		return false, ""
+	}
+
+	return true, fmt.Sprintf(
+		"entry edge invalidated current=%.2fbps mean=%.2fbps required>%.2fbps",
+		currentSpreadBps, meanSpreadBps, requiredEdge,
+	)
 }
 
 func (t *Trader) matchesOpenMakerOrder(update *exchanges.Order, makerOrder *exchanges.Order, clientID string) bool {
