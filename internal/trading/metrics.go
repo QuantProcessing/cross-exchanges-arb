@@ -1,9 +1,11 @@
-package main
+package trading
 
 import (
 	"fmt"
 	"strings"
 
+	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/shopspring/decimal"
 )
@@ -25,8 +27,8 @@ type RealizedProfitMetrics struct {
 
 func calculateRealizedProfitMetrics(
 	pos *ArbPosition,
-	cfg *Config,
-	makerFee, takerFee FeeInfo,
+	cfg *appconfig.Config,
+	makerFee, takerFee spread.FeeInfo,
 	closeLongOrder, closeShortOrder *exchanges.Order,
 ) (*RealizedProfitMetrics, error) {
 	if pos == nil {
@@ -117,7 +119,7 @@ func bpsFromQuote(quotePnL, referencePrice decimal.Decimal) float64 {
 	return bps
 }
 
-func legFeeRate(exchangeName string, cfg *Config, makerFee, takerFee FeeInfo, isClose bool) (float64, error) {
+func legFeeRate(exchangeName string, cfg *appconfig.Config, makerFee, takerFee spread.FeeInfo, isClose bool) (float64, error) {
 	switch {
 	case strings.EqualFold(exchangeName, cfg.MakerExchange):
 		if isClose {

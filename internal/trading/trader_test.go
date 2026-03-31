@@ -1,4 +1,4 @@
-package main
+package trading
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
@@ -30,6 +32,63 @@ type testExchange struct {
 	queuedOrders     []*exchanges.Order
 	ordersByID       map[string]*exchanges.Order
 	fetchOrderErr    error
+}
+
+type testEngine struct {
+	mu              sync.Mutex
+	snapshot        spread.Snapshot
+	roundTripFeeBps float64
+	currentZAB      float64
+	currentZBA      float64
+	makerFee        spread.FeeInfo
+	takerFee        spread.FeeInfo
+	onMarketUpdate  func()
+}
+
+func (e *testEngine) SetMarketUpdateCallback(cb func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onMarketUpdate = cb
+}
+
+func (e *testEngine) Snapshot() *spread.Snapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	snapshot := e.snapshot
+	return &snapshot
+}
+
+func (e *testEngine) RoundTripFeeBps() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.roundTripFeeBps
+}
+
+func (e *testEngine) CurrentZ() (float64, float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.currentZAB, e.currentZBA
+}
+
+func (e *testEngine) Fees() (spread.FeeInfo, spread.FeeInfo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.makerFee, e.takerFee
+}
+
+func (e *testEngine) setSnapshot(snapshot spread.Snapshot) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.snapshot = snapshot
+}
+
+func (e *testEngine) emitMarketUpdate() {
+	e.mu.Lock()
+	cb := e.onMarketUpdate
+	e.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 func newTestExchange(name string) *testExchange {
@@ -197,7 +256,7 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 	tr := &Trader{
 		maker: maker,
 		taker: taker,
-		config: &Config{
+		config: &appconfig.Config{
 			MakerExchange: "maker",
 			TakerExchange: "taker",
 			Symbol:        "BTC",
@@ -212,8 +271,8 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 	}
 
 	tr.openFlow = &openFlowState{
-		signal: &SpreadSignal{
-			Direction:      LongMakerShortTaker,
+		signal: &spread.Signal{
+			Direction:      spread.LongMakerShortTaker,
 			SpreadBps:      12.5,
 			ZScore:         2.1,
 			ExpectedProfit: 4.2,
@@ -236,9 +295,9 @@ func newTestTrader() *Trader {
 
 func newTestTraderWithPosition() *Trader {
 	tr, _, _ := newActiveFlowTrader()
-	tr.engine = &SpreadEngine{}
+	tr.engine = &testEngine{}
 	tr.position = &ArbPosition{
-		Direction:          LongMakerShortTaker,
+		Direction:          spread.LongMakerShortTaker,
 		OpenTime:           time.Now().Add(-time.Minute),
 		OpenQuantity:       decimal.RequireFromString("0.001"),
 		OpenExpectedProfit: 4.2,
@@ -265,7 +324,7 @@ func cloneTestOrder(order *exchanges.Order) *exchanges.Order {
 	return &clone
 }
 
-func waitForTraderState(t *testing.T, tr *Trader, want ExecutionState) {
+func waitForTraderState(t *testing.T, tr *Trader, want State) {
 	t.Helper()
 
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -337,16 +396,19 @@ func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	tr.config.MakerTimeout = 2 * time.Second
 	tr.config.MinProfitBps = 1.0
-	tr.engine = NewSpreadEngine(maker, taker, tr.config, zap.NewNop().Sugar())
-	tr.engine.statsAB.Add(0)
-	tr.engine.statsBA.Add(0)
-	tr.engine.makerBid = decimal.RequireFromString("100")
-	tr.engine.makerAsk = decimal.RequireFromString("100.10")
-	tr.engine.takerBid = decimal.RequireFromString("99.90")
-	tr.engine.takerAsk = decimal.RequireFromString("100.00")
+	engine := &testEngine{}
+	engine.setSnapshot(spread.Snapshot{
+		MakerBid: decimal.RequireFromString("100"),
+		MakerAsk: decimal.RequireFromString("100.10"),
+		TakerBid: decimal.RequireFromString("99.90"),
+		TakerAsk: decimal.RequireFromString("100.00"),
+		MeanAB:   0,
+		MeanBA:   0,
+	})
+	tr.engine = engine
 
-	sig := &SpreadSignal{
-		Direction:      LongMakerShortTaker,
+	sig := &spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
 		SpreadBps:      12.5,
 		ZScore:         2.1,
 		ExpectedProfit: 4.2,
@@ -384,15 +446,15 @@ func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
 }
 
 func TestTrader_CancelsPendingMakerOnImmediateMarketUpdate(t *testing.T) {
-	tr, maker, taker := newActiveFlowTrader()
+	tr, maker, _ := newActiveFlowTrader()
 	tr.config.MakerTimeout = 2 * time.Second
 	tr.config.MinProfitBps = 1.0
-	tr.engine = NewSpreadEngine(maker, taker, tr.config, zap.NewNop().Sugar())
-	tr.engine.statsAB.Add(0)
-	tr.engine.statsBA.Add(0)
+	engine := &testEngine{}
+	engine.setSnapshot(spread.Snapshot{MeanAB: 0, MeanBA: 0})
+	tr.engine = engine
 
-	sig := &SpreadSignal{
-		Direction:      LongMakerShortTaker,
+	sig := &spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
 		SpreadBps:      12.5,
 		ZScore:         2.1,
 		ExpectedProfit: 4.2,
@@ -405,12 +467,15 @@ func TestTrader_CancelsPendingMakerOnImmediateMarketUpdate(t *testing.T) {
 	tr.HandleSignal(sig)
 	waitForTraderState(t, tr, StateWaitingFill)
 
-	tr.engine.makerBid = decimal.RequireFromString("100")
-	tr.engine.makerAsk = decimal.RequireFromString("100.10")
-	tr.engine.takerBid = decimal.RequireFromString("99.90")
-	tr.engine.takerAsk = decimal.RequireFromString("100.00")
-
-	tr.engine.emitMarketUpdate()
+	engine.setSnapshot(spread.Snapshot{
+		MakerBid: decimal.RequireFromString("100"),
+		MakerAsk: decimal.RequireFromString("100.10"),
+		TakerBid: decimal.RequireFromString("99.90"),
+		TakerAsk: decimal.RequireFromString("100.00"),
+		MeanAB:   0,
+		MeanBA:   0,
+	})
+	engine.emitMarketUpdate()
 
 	waitForCondition(t, 80*time.Millisecond, func() bool {
 		maker.mu.Lock()
@@ -454,8 +519,8 @@ func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
 	if tr.position.ShortOrder == nil {
 		t.Fatal("close failure must retain the surviving short leg context")
 	}
-	tr.HandleSignal(&SpreadSignal{
-		Direction:      LongMakerShortTaker,
+	tr.HandleSignal(&spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
 		SpreadBps:      9.1,
 		ZScore:         2.2,
 		ExpectedProfit: 3.3,
@@ -551,8 +616,8 @@ func TestTrader_CompletedRoundsIncrementOncePerResolvedClose(t *testing.T) {
 func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	tr.config.MakerTimeout = 50 * time.Millisecond
-	sig := &SpreadSignal{
-		Direction:      LongMakerShortTaker,
+	sig := &spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
 		SpreadBps:      12.5,
 		ZScore:         2.1,
 		ExpectedProfit: 4.2,
@@ -641,7 +706,7 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	tr.position = &ArbPosition{
-		Direction:     LongMakerShortTaker,
+		Direction:     spread.LongMakerShortTaker,
 		OpenTime:      time.Now().Add(-time.Minute),
 		OpenQuantity:  decimal.RequireFromString("0.001"),
 		LongExchange:  "maker",
@@ -729,7 +794,7 @@ func TestTrader_StartSucceedsWhenWatchOrdersRegistersAsync(t *testing.T) {
 
 func TestTrader_FinalizeOpenFlowAssignsLongShortOrdersByDirection(t *testing.T) {
 	tr, _, _ := newActiveFlowTrader()
-	tr.openFlow.signal.Direction = LongTakerShortMaker
+	tr.openFlow.signal.Direction = spread.LongTakerShortMaker
 	tr.openFlow.lastHedgeOrder = &exchanges.Order{
 		OrderID: "taker-open",
 		Price:   decimal.RequireFromString("100"),
@@ -759,12 +824,12 @@ func TestTrader_FinalizeOpenFlowAssignsLongShortOrdersByDirection(t *testing.T) 
 }
 
 func TestCalculateRealizedProfitMetrics_LongMakerShortTaker(t *testing.T) {
-	cfg := &Config{
+	cfg := &appconfig.Config{
 		MakerExchange: "maker",
 		TakerExchange: "taker",
 	}
 	pos := &ArbPosition{
-		Direction:     LongMakerShortTaker,
+		Direction:     spread.LongMakerShortTaker,
 		LongExchange:  "maker",
 		ShortExchange: "taker",
 		LongOrder: &exchanges.Order{
@@ -786,8 +851,8 @@ func TestCalculateRealizedProfitMetrics_LongMakerShortTaker(t *testing.T) {
 	}
 
 	metrics, err := calculateRealizedProfitMetrics(pos, cfg,
-		FeeInfo{MakerRate: 0.0001, TakerRate: 0.0003},
-		FeeInfo{MakerRate: 0.0002, TakerRate: 0.0004},
+		spread.FeeInfo{MakerRate: 0.0001, TakerRate: 0.0003},
+		spread.FeeInfo{MakerRate: 0.0002, TakerRate: 0.0004},
 		closeLong, closeShort,
 	)
 	if err != nil {

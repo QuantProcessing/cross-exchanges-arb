@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"flag"
@@ -42,8 +42,8 @@ type Config struct {
 	ObserveOnly bool // Phase 0: only collect data, output CSV
 }
 
-// ParseConfig parses CLI flags and returns a Config.
-func ParseConfig() *Config {
+// Parse parses CLI flags and returns a Config.
+func Parse() *Config {
 	c := &Config{}
 
 	// Exchange pair

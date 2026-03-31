@@ -1,4 +1,4 @@
-package main
+package trading
 
 import "testing"
 
@@ -14,7 +14,7 @@ func TestExecutionState_AllowsSignalOnlyWhenIdle(t *testing.T) {
 func TestCanAcceptSignal_CoversAllExecutionStates(t *testing.T) {
 	tests := []struct {
 		name  string
-		state ExecutionState
+		state State
 		want  bool
 	}{
 		{name: "idle", state: StateIdle, want: true},
@@ -43,7 +43,7 @@ func TestExecutionState_BlocksTradingInManualIntervention(t *testing.T) {
 }
 
 func TestIsTerminalRoundBlocker_ExplicitStateContract(t *testing.T) {
-	blockingStates := []ExecutionState{
+	blockingStates := []State{
 		StatePlacingMaker,
 		StateWaitingFill,
 		StateHedging,
@@ -59,7 +59,7 @@ func TestIsTerminalRoundBlocker_ExplicitStateContract(t *testing.T) {
 }
 
 func TestIsTerminalRoundBlocker_NonBlockingStates(t *testing.T) {
-	nonBlockingStates := []ExecutionState{
+	nonBlockingStates := []State{
 		StateIdle,
 		StateCooldown,
 	}

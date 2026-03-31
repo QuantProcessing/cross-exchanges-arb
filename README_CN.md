@@ -42,11 +42,12 @@
 |:-------|:-----|:-----|
 | [Decibel](https://www.decibel.exchange/) | Maker 或 Taker | 永续合约，当前验证路径优先支持 |
 | [EdgeX](https://www.edgex.exchange/) | Maker 或 Taker | 永续合约，需要 API Key + Account ID |
+| [Hyperliquid](https://hyperliquid.xyz/) | Maker 或 Taker | 永续合约，已通过 registry 接线支持 |
 | [Lighter](https://lighter.xyz/) | Maker 或 Taker | 永续合约，零手续费，推荐作为 Taker |
 
 基于 [exchanges](https://github.com/QuantProcessing/exchanges) `v0.2.0` 统一 SDK 构建。当前项目已改为通过 SDK registry 创建交易所，不再在策略层硬编码构造函数，业务逻辑始终只依赖 `exchanges.Exchange`。
 
-当前仓库已内置 `DECIBEL`、`LIGHTER`、`EDGEX` 的凭证映射。整体执行模型面向任意两家 perp 交易所，但目前实际优先验证的是 `DECIBEL` maker + `LIGHTER` taker 这条路径。
+当前仓库已内置 `DECIBEL`、`LIGHTER`、`EDGEX`、`HYPERLIQUID` 的凭证映射。整体执行模型面向任意两家 perp 交易所，但目前实际优先验证的是 `DECIBEL` maker + `LIGHTER` taker 这条路径。
 
 ## 快速开始
 
@@ -169,15 +170,24 @@ pm2 restart cross-arb   # 重启
 pm2 stop cross-arb      # 停止
 ```
 
+## 测试
+
+```bash
+go test ./...
+```
+
 ## 项目结构
 
 ```
-├── main.go             # 入口，适配器创建，优雅关闭
-├── config.go           # 命令行参数解析与配置
-├── spread_engine.go    # Z-Score 模型，BBO 监控，信号生成
-├── trader.go           # Maker-Taker 执行，仓位管理
-├── ecosystem.config.js # PM2 进程管理配置
-├── .env.example        # 环境变量模板
+├── main.go                  # 精简入口，只负责 CLI 启动
+├── internal/
+│   ├── app/                # 启动编排、运行时接线
+│   ├── config/             # CLI 解析与配置校验
+│   ├── exchange/           # 交易所 registry 接线与凭证映射
+│   ├── spread/             # 滚动统计、盘口监控、信号生成
+│   └── trading/            # 交易状态机、执行流程、PnL 跟踪
+├── ecosystem.config.js     # PM2 进程管理配置
+├── .env.example            # 环境变量模板
 └── .gitignore
 ```
 

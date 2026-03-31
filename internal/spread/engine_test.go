@@ -1,16 +1,17 @@
-package main
+package spread
 
 import (
 	"math"
 	"testing"
 	"time"
 
+	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
 
 func TestSpreadStats_RollingWindowTracksCurrentSamples(t *testing.T) {
-	stats := NewSpreadStats(3)
+	stats := NewStats(3)
 	samples := []float64{1, 2, 3, 4, 5}
 
 	for _, sample := range samples {
@@ -32,7 +33,7 @@ func TestSpreadStats_RollingWindowTracksCurrentSamples(t *testing.T) {
 }
 
 func TestSpreadStats_StdDevIsStableForLargeOffsets(t *testing.T) {
-	stats := NewSpreadStats(8)
+	stats := NewStats(8)
 	base := 1e12
 	window := []float64{
 		base + 0,
@@ -59,7 +60,7 @@ func TestSpreadStats_StdDevIsStableForLargeOffsets(t *testing.T) {
 }
 
 func TestSpreadEngine_EmitSignalCallbackCanReenterEngine(t *testing.T) {
-	cfg := &Config{
+	cfg := &appconfig.Config{
 		Symbol:         "BTC",
 		WindowSize:     10,
 		ZOpen:          -1,
@@ -68,15 +69,15 @@ func TestSpreadEngine_EmitSignalCallbackCanReenterEngine(t *testing.T) {
 		WarmupDuration: 0,
 	}
 
-	engine := NewSpreadEngine(nil, nil, cfg, zap.NewNop().Sugar())
+	engine := New(nil, nil, cfg, zap.NewNop().Sugar())
 	engine.makerBid = decimal.RequireFromString("100")
 	engine.makerAsk = decimal.RequireFromString("101")
 	engine.takerBid = decimal.RequireFromString("102")
 	engine.takerAsk = decimal.RequireFromString("103")
 
 	done := make(chan struct{}, 1)
-	engine.SetSignalCallback(func(signal *SpreadSignal) {
-		engine.GetCurrentZ()
+	engine.SetSignalCallback(func(signal *Signal) {
+		engine.CurrentZ()
 		done <- struct{}{}
 	})
 
@@ -90,16 +91,16 @@ func TestSpreadEngine_EmitSignalCallbackCanReenterEngine(t *testing.T) {
 }
 
 func TestSpreadEngine_RoundTripFeeBpsMatchesExecutionPath(t *testing.T) {
-	engine := &SpreadEngine{}
+	engine := &Engine{}
 	engine.SetFees(
 		FeeInfo{MakerRate: 0.0001, TakerRate: 0.0003},
 		FeeInfo{MakerRate: 0.0002, TakerRate: 0.0005},
 	)
 
-	got := engine.roundTripFeeBps()
+	got := engine.RoundTripFeeBps()
 	want := (0.0001 + 0.0003 + 0.0005 + 0.0005) * 10000
 	if math.Abs(got-want) > 1e-12 {
-		t.Fatalf("roundTripFeeBps = %.12f, want %.12f", got, want)
+		t.Fatalf("RoundTripFeeBps = %.12f, want %.12f", got, want)
 	}
 }
 

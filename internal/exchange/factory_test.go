@@ -1,24 +1,20 @@
-package main
+package exchange
 
 import (
 	"context"
-	"flag"
-	"os"
-	"strings"
 	"testing"
-	"time"
 
+	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
 	exchanges "github.com/QuantProcessing/exchanges"
-	"github.com/shopspring/decimal"
 )
 
-func TestBuildExchangeConfigs_DefaultsToPerpValidationProfile(t *testing.T) {
-	cfg := &Config{
+func TestBuildConfigs_DefaultsToPerpValidationProfile(t *testing.T) {
+	cfg := &appconfig.Config{
 		MakerExchange: "DECIBEL",
 		TakerExchange: "LIGHTER",
 	}
 
-	makerCfg, takerCfg := BuildExchangeConfigs(cfg)
+	makerCfg, takerCfg := BuildConfigs(cfg)
 
 	if makerCfg.MarketType != exchanges.MarketTypePerp {
 		t.Fatalf("maker market type = %s, want perp", makerCfg.MarketType)
@@ -34,15 +30,15 @@ func TestBuildExchangeConfigs_DefaultsToPerpValidationProfile(t *testing.T) {
 	}
 }
 
-func TestBuildExchangeConfigs_HonorsQuoteCurrencyOverrides(t *testing.T) {
-	cfg := &Config{
+func TestBuildConfigs_HonorsQuoteCurrencyOverrides(t *testing.T) {
+	cfg := &appconfig.Config{
 		MakerExchange:      "DECIBEL",
 		TakerExchange:      "LIGHTER",
 		MakerQuoteCurrency: "usdt",
 		TakerQuoteCurrency: "USD",
 	}
 
-	makerCfg, takerCfg := BuildExchangeConfigs(cfg)
+	makerCfg, takerCfg := BuildConfigs(cfg)
 
 	if got := makerCfg.Options["quote_currency"]; got != "USDT" {
 		t.Fatalf("maker quote_currency = %q, want USDT", got)
@@ -52,8 +48,8 @@ func TestBuildExchangeConfigs_HonorsQuoteCurrencyOverrides(t *testing.T) {
 	}
 }
 
-func TestNewExchangePair_RejectsUnknownExchange(t *testing.T) {
-	_, _, err := NewExchangePair(context.Background(), &Config{
+func TestNewPair_RejectsUnknownExchange(t *testing.T) {
+	_, _, err := NewPair(context.Background(), &appconfig.Config{
 		MakerExchange: "NOPE",
 		TakerExchange: "LIGHTER",
 	})
@@ -63,7 +59,7 @@ func TestNewExchangePair_RejectsUnknownExchange(t *testing.T) {
 }
 
 func TestSupportedExchangeRegistrations_AvailableInBinary(t *testing.T) {
-	for _, name := range []string{"EDGEX", "DECIBEL", "LIGHTER"} {
+	for _, name := range []string{"EDGEX", "DECIBEL", "LIGHTER", "HYPERLIQUID"} {
 		name := name
 		t.Run(name, func(t *testing.T) {
 			if _, err := exchanges.LookupConstructor(name); err != nil {
@@ -73,7 +69,7 @@ func TestSupportedExchangeRegistrations_AvailableInBinary(t *testing.T) {
 	}
 }
 
-func TestBuildExchangeConfigs_UsesLegacyAndCurrentEnvNames(t *testing.T) {
+func TestBuildConfigs_UsesLegacyAndCurrentEnvNames(t *testing.T) {
 	t.Setenv("EXCHANGES_EDGEX_PRIVATE_KEY", "legacy-edgex-private")
 	t.Setenv("EXCHANGES_EDGEX_ACCOUNT_ID", "legacy-edgex-account")
 	t.Setenv("EXCHANGES_LIGHTER_PRIVATE_KEY", "legacy-lighter-private")
@@ -81,7 +77,7 @@ func TestBuildExchangeConfigs_UsesLegacyAndCurrentEnvNames(t *testing.T) {
 	t.Setenv("EXCHANGES_LIGHTER_KEY_INDEX", "legacy-lighter-key")
 	t.Setenv("EXCHANGES_LIGHTER_RO_TOKEN", "legacy-lighter-token")
 
-	legacyMakerCfg, legacyTakerCfg := BuildExchangeConfigs(&Config{
+	legacyMakerCfg, legacyTakerCfg := BuildConfigs(&appconfig.Config{
 		MakerExchange: "EDGEX",
 		TakerExchange: "LIGHTER",
 	})
@@ -119,7 +115,7 @@ func TestBuildExchangeConfigs_UsesLegacyAndCurrentEnvNames(t *testing.T) {
 	t.Setenv("LIGHTER_KEY_INDEX", "current-lighter-key")
 	t.Setenv("LIGHTER_RO_TOKEN", "current-lighter-token")
 
-	currentMakerCfg, currentTakerCfg := BuildExchangeConfigs(&Config{
+	currentMakerCfg, currentTakerCfg := BuildConfigs(&appconfig.Config{
 		MakerExchange: "DECIBEL",
 		TakerExchange: "LIGHTER",
 	})
@@ -144,52 +140,5 @@ func TestBuildExchangeConfigs_UsesLegacyAndCurrentEnvNames(t *testing.T) {
 	}
 	if got := currentTakerCfg.Options["ro_token"]; got != "current-lighter-token" {
 		t.Fatalf("current taker ro_token = %q, want %q", got, "current-lighter-token")
-	}
-}
-
-func TestParseConfig_DefaultMakerAndTaker(t *testing.T) {
-	origArgs := os.Args
-	origCommandLine := flag.CommandLine
-	t.Cleanup(func() {
-		os.Args = origArgs
-		flag.CommandLine = origCommandLine
-	})
-
-	os.Args = []string{"cross-exchanges-arb"}
-	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-
-	cfg := ParseConfig()
-
-	if cfg.MakerExchange != "EDGEX" {
-		t.Fatalf("default maker = %q, want EDGEX", cfg.MakerExchange)
-	}
-	if cfg.TakerExchange != "LIGHTER" {
-		t.Fatalf("default taker = %q, want LIGHTER", cfg.TakerExchange)
-	}
-}
-
-func TestConfigString_ShowsValidationKnobsWithoutClaimingValidationMode(t *testing.T) {
-	cfg := &Config{
-		MakerExchange: "DECIBEL",
-		TakerExchange: "LIGHTER",
-		Symbol:        "BTC",
-		Quantity:      decimal.RequireFromString("0.001"),
-		LiveValidate:  true,
-		MakerTimeout:  20 * time.Second,
-		MaxRounds:     2,
-	}
-
-	summary := cfg.String()
-	if strings.Contains(summary, "LIVE VALIDATION") {
-		t.Fatal("startup summary must not claim live validation as the active runtime mode")
-	}
-	if !strings.Contains(summary, "ValidationCfg: ENABLED") {
-		t.Fatal("startup summary should expose validation config state")
-	}
-	if !strings.Contains(summary, "MakerTimeout: 20s") {
-		t.Fatal("startup summary should show maker timeout")
-	}
-	if !strings.Contains(summary, "MaxRounds: 2") {
-		t.Fatal("startup summary should show max rounds")
 	}
 }

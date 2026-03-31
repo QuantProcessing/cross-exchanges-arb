@@ -1,4 +1,4 @@
-package main
+package exchange
 
 import (
 	"context"
@@ -6,25 +6,26 @@ import (
 	"os"
 	"strings"
 
+	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
 	exchanges "github.com/QuantProcessing/exchanges"
 )
 
-type ExchangeRuntimeConfig struct {
+type RuntimeConfig struct {
 	Name       string
 	MarketType exchanges.MarketType
 	Options    map[string]string
 }
 
-func BuildExchangeConfigs(cfg *Config) (ExchangeRuntimeConfig, ExchangeRuntimeConfig) {
+func BuildConfigs(cfg *appconfig.Config) (RuntimeConfig, RuntimeConfig) {
 	if cfg == nil {
-		return ExchangeRuntimeConfig{}, ExchangeRuntimeConfig{}
+		return RuntimeConfig{}, RuntimeConfig{}
 	}
 	maker := buildExchangeRuntimeConfig(cfg.MakerExchange, cfg.MakerQuoteCurrency)
 	taker := buildExchangeRuntimeConfig(cfg.TakerExchange, cfg.TakerQuoteCurrency)
 	return maker, taker
 }
 
-func NewExchange(ctx context.Context, rc ExchangeRuntimeConfig) (exchanges.Exchange, error) {
+func New(ctx context.Context, rc RuntimeConfig) (exchanges.Exchange, error) {
 	ctor, err := exchanges.LookupConstructor(rc.Name)
 	if err != nil {
 		return nil, err
@@ -32,18 +33,18 @@ func NewExchange(ctx context.Context, rc ExchangeRuntimeConfig) (exchanges.Excha
 	return ctor(ctx, rc.MarketType, rc.Options)
 }
 
-func NewExchangePair(ctx context.Context, cfg *Config) (exchanges.Exchange, exchanges.Exchange, error) {
+func NewPair(ctx context.Context, cfg *appconfig.Config) (exchanges.Exchange, exchanges.Exchange, error) {
 	if cfg == nil {
 		return nil, nil, fmt.Errorf("config is required")
 	}
-	makerCfg, takerCfg := BuildExchangeConfigs(cfg)
+	makerCfg, takerCfg := BuildConfigs(cfg)
 
-	maker, err := NewExchange(ctx, makerCfg)
+	maker, err := New(ctx, makerCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create maker %s: %w", makerCfg.Name, err)
 	}
 
-	taker, err := NewExchange(ctx, takerCfg)
+	taker, err := New(ctx, takerCfg)
 	if err != nil {
 		_ = maker.Close()
 		return nil, nil, fmt.Errorf("create taker %s: %w", takerCfg.Name, err)
@@ -52,9 +53,9 @@ func NewExchangePair(ctx context.Context, cfg *Config) (exchanges.Exchange, exch
 	return maker, taker, nil
 }
 
-func buildExchangeRuntimeConfig(name, quoteCurrency string) ExchangeRuntimeConfig {
+func buildExchangeRuntimeConfig(name, quoteCurrency string) RuntimeConfig {
 	normalized := strings.ToUpper(strings.TrimSpace(name))
-	rc := ExchangeRuntimeConfig{
+	rc := RuntimeConfig{
 		Name:       normalized,
 		MarketType: exchanges.MarketTypePerp,
 		Options: map[string]string{

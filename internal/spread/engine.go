@@ -1,176 +1,25 @@
-package main
+package spread
 
 import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"math"
 	"os"
 	"sync"
 	"time"
 
+	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
 
-// --- Spread Statistics (Rolling Window / Ring Buffer) ---
-
-// SpreadStats maintains rolling statistics (mean, stddev) over a fixed-size ring buffer.
-// The ring buffer prevents memory leaks from slice reslicing.
-type SpreadStats struct {
-	buf     []float64
-	maxSize int
-	count   int // total items written (capped at maxSize)
-	writeAt int // next write position
-	mean    float64
-	stddev  float64
-	dirty   bool
-}
-
-// NewSpreadStats creates a new stats tracker with the given window size.
-func NewSpreadStats(windowSize int) *SpreadStats {
-	if windowSize < 1 {
-		windowSize = 1
-	}
-	return &SpreadStats{
-		buf:     make([]float64, windowSize),
-		maxSize: windowSize,
-		dirty:   true,
-	}
-}
-
-// Add inserts a new spread value into the ring buffer.
-func (s *SpreadStats) Add(spread float64) {
-	s.buf[s.writeAt] = spread
-	s.writeAt = (s.writeAt + 1) % s.maxSize
-	if s.count < s.maxSize {
-		s.count++
-	}
-	s.dirty = true
-}
-
-// Count returns the number of samples in the window.
-func (s *SpreadStats) Count() int {
-	return s.count
-}
-
-// Mean returns the rolling mean.
-func (s *SpreadStats) Mean() float64 {
-	s.recomputeIfDirty()
-	return s.mean
-}
-
-// StdDev returns the rolling standard deviation.
-func (s *SpreadStats) StdDev() float64 {
-	s.recomputeIfDirty()
-	return s.stddev
-}
-
-// ZScore returns the Z-Score of a given spread value relative to the rolling distribution.
-func (s *SpreadStats) ZScore(spread float64) float64 {
-	sd := s.StdDev()
-	if sd < 1e-9 {
-		return 0
-	}
-	return (spread - s.Mean()) / sd
-}
-
-// activeSlice returns the current valid data in insertion order.
-func (s *SpreadStats) activeSlice() []float64 {
-	if s.count < s.maxSize {
-		return s.buf[:s.count]
-	}
-	// Ring buffer is full: writeAt points to the oldest element.
-	result := make([]float64, s.maxSize)
-	copy(result, s.buf[s.writeAt:])
-	copy(result[s.maxSize-s.writeAt:], s.buf[:s.writeAt])
-	return result
-}
-
-func (s *SpreadStats) recomputeIfDirty() {
-	if !s.dirty {
-		return
-	}
-
-	data := s.activeSlice()
-	if len(data) == 0 {
-		s.mean = 0
-		s.stddev = 0
-		s.dirty = false
-		return
-	}
-
-	// Welford's online algorithm for numerically stable single-pass computation.
-	mean := 0.0
-	m2 := 0.0
-	for i, sample := range data {
-		delta := sample - mean
-		mean += delta / float64(i+1)
-		delta2 := sample - mean
-		m2 += delta * delta2
-	}
-
-	s.mean = mean
-	if len(data) < 2 {
-		s.stddev = 0
-		s.dirty = false
-		return
-	}
-
-	variance := m2 / float64(len(data)-1) // Bessel's correction for sample variance
-	if variance < 0 {
-		variance = 0
-	}
-	s.stddev = math.Sqrt(variance)
-	s.dirty = false
-}
-
-// --- Spread Signal ---
-
-// SpreadDirection indicates which direction to trade.
-type SpreadDirection string
-
-const (
-	// LongMakerShortTaker: buy on maker exchange, sell on taker exchange.
-	LongMakerShortTaker SpreadDirection = "LONG_MAKER_SHORT_TAKER"
-	// LongTakerShortMaker: buy on taker exchange, sell on maker exchange.
-	LongTakerShortMaker SpreadDirection = "LONG_TAKER_SHORT_MAKER"
-)
-
-// SpreadSignal represents a detected arbitrage opportunity.
-type SpreadSignal struct {
-	Direction      SpreadDirection
-	SpreadBps      float64         // current spread in BPS
-	ZScore         float64         // Z-Score of the spread
-	Mean           float64         // current rolling mean (BPS)
-	StdDev         float64         // current rolling stddev (BPS)
-	ExpectedProfit float64         // expected profit BPS (spread recovery to mean minus fees)
-	MakerBid       decimal.Decimal // maker exchange best bid
-	MakerAsk       decimal.Decimal // maker exchange best ask
-	TakerBid       decimal.Decimal // taker exchange best bid
-	TakerAsk       decimal.Decimal // taker exchange best ask
-	Timestamp      time.Time
-}
-
-// SpreadSnapshot captures the current top-of-book and rolling spread statistics.
-type SpreadSnapshot struct {
-	MakerBid decimal.Decimal
-	MakerAsk decimal.Decimal
-	TakerBid decimal.Decimal
-	TakerAsk decimal.Decimal
-	MeanAB   float64
-	MeanBA   float64
-}
-
-// --- Spread Engine ---
-
-// SpreadEngine monitors BBO from two exchanges and detects arbitrage signals.
-type SpreadEngine struct {
+// Engine monitors BBO from two exchanges and detects arbitrage signals.
+type Engine struct {
 	maker  exchanges.Exchange
 	taker  exchanges.Exchange
 	symbol string
-	config *Config
+	config *appconfig.Config
 	logger *zap.SugaredLogger
 
 	mu       sync.Mutex
@@ -180,8 +29,8 @@ type SpreadEngine struct {
 	takerAsk decimal.Decimal
 
 	// Rolling stats for both directions
-	statsAB *SpreadStats // spread: takerBid - makerAsk (Long Maker, Short Taker)
-	statsBA *SpreadStats // spread: makerBid - takerAsk (Long Taker, Short Maker)
+	statsAB *Stats // spread: takerBid - makerAsk (Long Maker, Short Taker)
+	statsBA *Stats // spread: makerBid - takerAsk (Long Taker, Short Maker)
 
 	// Warmup tracking
 	firstSeen    time.Time
@@ -193,7 +42,7 @@ type SpreadEngine struct {
 	takerFee FeeInfo
 
 	// Signal callback
-	onSignal       func(signal *SpreadSignal)
+	onSignal       func(signal *Signal)
 	onMarketUpdate func()
 
 	// CSV writer for observe-only mode
@@ -201,51 +50,53 @@ type SpreadEngine struct {
 	csvFile   *os.File
 }
 
-// FeeInfo holds maker/taker fee rates for an exchange.
-type FeeInfo struct {
-	MakerRate float64 // e.g. 0.0001 = 1 BPS
-	TakerRate float64 // e.g. 0.0004 = 4 BPS
-}
-
-// NewSpreadEngine creates a new spread engine.
-func NewSpreadEngine(maker, taker exchanges.Exchange, cfg *Config, logger *zap.SugaredLogger) *SpreadEngine {
-	return &SpreadEngine{
+// New creates a new spread engine.
+func New(maker, taker exchanges.Exchange, cfg *appconfig.Config, logger *zap.SugaredLogger) *Engine {
+	return &Engine{
 		maker:   maker,
 		taker:   taker,
 		symbol:  cfg.Symbol,
 		config:  cfg,
 		logger:  logger,
-		statsAB: NewSpreadStats(cfg.WindowSize),
-		statsBA: NewSpreadStats(cfg.WindowSize),
+		statsAB: NewStats(cfg.WindowSize),
+		statsBA: NewStats(cfg.WindowSize),
 	}
 }
 
 // SetFees configures the fee rates for both exchanges.
-func (e *SpreadEngine) SetFees(makerFee, takerFee FeeInfo) {
+func (e *Engine) SetFees(makerFee, takerFee FeeInfo) {
 	e.makerFee = makerFee
 	e.takerFee = takerFee
 }
 
+// Fees returns the fee schedules currently configured on the engine.
+func (e *Engine) Fees() (maker FeeInfo, taker FeeInfo) {
+	if e == nil {
+		return FeeInfo{}, FeeInfo{}
+	}
+	return e.makerFee, e.takerFee
+}
+
 // SetSignalCallback sets the callback for when a signal is detected.
-func (e *SpreadEngine) SetSignalCallback(cb func(signal *SpreadSignal)) {
+func (e *Engine) SetSignalCallback(cb func(signal *Signal)) {
 	e.onSignal = cb
 }
 
 // SetMarketUpdateCallback sets the callback for any top-of-book update.
-func (e *SpreadEngine) SetMarketUpdateCallback(cb func()) {
+func (e *Engine) SetMarketUpdateCallback(cb func()) {
 	e.onMarketUpdate = cb
 }
 
-// roundTripFeeBps calculates the total round-trip fee in BPS.
+// RoundTripFeeBps calculates the total round-trip fee in BPS.
 // A round-trip involves 4 fee events: maker open, taker hedge open, maker close,
 // and taker close. The current execution path opens on the maker exchange with a
 // maker order, then closes both sides with market orders.
-func (e *SpreadEngine) roundTripFeeBps() float64 {
+func (e *Engine) RoundTripFeeBps() float64 {
 	return (e.makerFee.MakerRate + e.makerFee.TakerRate + e.takerFee.TakerRate + e.takerFee.TakerRate) * 10000
 }
 
 // Start begins monitoring spread via WatchOrderBook on both exchanges.
-func (e *SpreadEngine) Start(ctx context.Context) error {
+func (e *Engine) Start(ctx context.Context) error {
 	// Setup CSV writer for observe-only mode
 	if e.config.ObserveOnly {
 		filename := fmt.Sprintf("spread_%s_%s_%s_%s.csv",
@@ -311,7 +162,7 @@ func (e *SpreadEngine) Start(ctx context.Context) error {
 }
 
 // Close cleans up resources.
-func (e *SpreadEngine) Close() {
+func (e *Engine) Close() {
 	if e.csvWriter != nil {
 		e.csvWriter.Flush()
 	}
@@ -322,7 +173,7 @@ func (e *SpreadEngine) Close() {
 
 // onBBOUpdate is called whenever either exchange's BBO updates.
 // It is called concurrently from maker and taker WatchOrderBook goroutines.
-func (e *SpreadEngine) onBBOUpdate() {
+func (e *Engine) onBBOUpdate() {
 	e.mu.Lock()
 	makerBid := e.makerBid
 	makerAsk := e.makerAsk
@@ -420,13 +271,13 @@ func (e *SpreadEngine) onBBOUpdate() {
 	}
 
 	// Evaluate signals (outside lock, using snapshotted values)
-	fees := e.roundTripFeeBps()
+	fees := e.RoundTripFeeBps()
 
 	// Check AB direction: Long maker, Short taker
 	if zAB > e.config.ZOpen {
 		expectedProfit := spreadAB - meanAB
 		if expectedProfit > fees+e.config.MinProfitBps {
-			e.emitSignal(&SpreadSignal{
+			e.emitSignal(&Signal{
 				Direction:      LongMakerShortTaker,
 				SpreadBps:      spreadAB,
 				ZScore:         zAB,
@@ -446,7 +297,7 @@ func (e *SpreadEngine) onBBOUpdate() {
 	if zBA > e.config.ZOpen {
 		expectedProfit := spreadBA - meanBA
 		if expectedProfit > fees+e.config.MinProfitBps {
-			e.emitSignal(&SpreadSignal{
+			e.emitSignal(&Signal{
 				Direction:      LongTakerShortMaker,
 				SpreadBps:      spreadBA,
 				ZScore:         zBA,
@@ -463,20 +314,20 @@ func (e *SpreadEngine) onBBOUpdate() {
 	}
 }
 
-func (e *SpreadEngine) emitSignal(sig *SpreadSignal) {
+func (e *Engine) emitSignal(sig *Signal) {
 	if e.onSignal != nil {
 		e.onSignal(sig)
 	}
 }
 
-func (e *SpreadEngine) emitMarketUpdate() {
+func (e *Engine) emitMarketUpdate() {
 	if e.onMarketUpdate != nil {
 		e.onMarketUpdate()
 	}
 }
 
 // Snapshot returns the latest top-of-book data and rolling means.
-func (e *SpreadEngine) Snapshot() *SpreadSnapshot {
+func (e *Engine) Snapshot() *Snapshot {
 	if e == nil {
 		return nil
 	}
@@ -493,7 +344,7 @@ func (e *SpreadEngine) Snapshot() *SpreadSnapshot {
 		meanBA = e.statsBA.Mean()
 	}
 
-	return &SpreadSnapshot{
+	return &Snapshot{
 		MakerBid: e.makerBid,
 		MakerAsk: e.makerAsk,
 		TakerBid: e.takerBid,
@@ -503,9 +354,9 @@ func (e *SpreadEngine) Snapshot() *SpreadSnapshot {
 	}
 }
 
-// GetCurrentZ returns the current Z-Scores for both directions.
+// CurrentZ returns the current Z-Scores for both directions.
 // Used by the trader to check close/stop-loss conditions.
-func (e *SpreadEngine) GetCurrentZ() (zAB, zBA float64) {
+func (e *Engine) CurrentZ() (zAB, zBA float64) {
 	e.mu.Lock()
 	makerBid := e.makerBid
 	makerAsk := e.makerAsk
@@ -538,7 +389,7 @@ func (e *SpreadEngine) GetCurrentZ() (zAB, zBA float64) {
 }
 
 // IsWarmedUp returns whether the engine has enough data to emit signals.
-func (e *SpreadEngine) IsWarmedUp() bool {
+func (e *Engine) IsWarmedUp() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.tickCount >= e.config.WarmupTicks &&
@@ -546,7 +397,7 @@ func (e *SpreadEngine) IsWarmedUp() bool {
 }
 
 // logWarmupMilestone logs warmup progress at 25/50/75/100% milestones. Must be called under e.mu.
-func (e *SpreadEngine) logWarmupMilestone(tickCount int, now time.Time) {
+func (e *Engine) logWarmupMilestone(tickCount int, now time.Time) {
 	elapsed := now.Sub(e.firstSeen).Round(time.Second)
 	target := e.config.WarmupTicks
 	durationMet := elapsed >= e.config.WarmupDuration

@@ -16,6 +16,7 @@ cross-arb
 
 # Data output
 *.csv
+cross-arb.log
 
 # Agent skills
 .agent/

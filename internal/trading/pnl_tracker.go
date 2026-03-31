@@ -1,4 +1,4 @@
-package main
+package trading
 
 import (
 	"context"
@@ -28,11 +28,11 @@ type PnLTracker struct {
 	currentMakerBal decimal.Decimal
 	currentTakerBal decimal.Decimal
 
-	lastRefresh       time.Time
-	rounds            int
-	makerFetchFailed  bool
-	takerFetchFailed  bool
-	consecutiveFails  int
+	lastRefresh      time.Time
+	rounds           int
+	makerFetchFailed bool
+	takerFetchFailed bool
+	consecutiveFails int
 }
 
 // NewPnLTracker creates a tracker and snapshots initial balances.
@@ -128,4 +128,12 @@ func (p *PnLTracker) StartupSummary() string {
 		p.makerName, p.startMakerBal,
 		p.takerName, p.startTakerBal,
 		p.startMakerBal.Add(p.startTakerBal))
+}
+
+// RoundCount returns the number of completed rounds recorded by the tracker.
+func (p *PnLTracker) RoundCount() int {
+	if p == nil {
+		return 0
+	}
+	return p.rounds
 }

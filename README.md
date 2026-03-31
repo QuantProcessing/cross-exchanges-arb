@@ -42,11 +42,12 @@ Exchange A (Maker)         Exchange B (Taker)
 |:---------|:-----|:------|
 | [Decibel](https://www.decibel.exchange/) | Maker or Taker | Perp futures, tested first-class in the current validation flow |
 | [EdgeX](https://www.edgex.exchange/) | Maker or Taker | Perp futures, requires API key + account ID |
+| [Hyperliquid](https://hyperliquid.xyz/) | Maker or Taker | Perp futures, supported through registry-based exchange wiring |
 | [Lighter](https://lighter.xyz/) | Maker or Taker | Perp futures, zero taker fees recommended as taker |
 
 Built on the [exchanges](https://github.com/QuantProcessing/exchanges) `v0.2.0` unified SDK. This repo now creates exchanges through the SDK registry instead of hard-coded constructors, so the strategy layer stays on top of `exchanges.Exchange`.
 
-Current repo wiring includes ready-to-run credential mapping for `DECIBEL`, `LIGHTER`, and `EDGEX`. The execution model is intended for any two perp exchanges exposed through `exchanges`, but the validated path in this repo is currently `DECIBEL` maker + `LIGHTER` taker.
+Current repo wiring includes ready-to-run credential mapping for `DECIBEL`, `LIGHTER`, `EDGEX`, and `HYPERLIQUID`. The execution model is intended for any two perp exchanges exposed through `exchanges`, but the validated path in this repo is currently `DECIBEL` maker + `LIGHTER` taker.
 
 ## Quick Start
 
@@ -165,15 +166,24 @@ pm2 restart cross-arb
 pm2 stop cross-arb
 ```
 
+## Testing
+
+```bash
+go test ./...
+```
+
 ## Project Structure
 
 ```
-├── main.go             # Entry point, adapter creation, graceful shutdown
-├── config.go           # CLI flag parsing and configuration
-├── spread_engine.go    # Z-Score model, BBO monitoring, signal generation
-├── trader.go           # Maker-taker execution, position management
-├── ecosystem.config.js # PM2 process manager config
-├── .env.example        # Environment variable template
+├── main.go                  # Thin CLI entrypoint
+├── internal/
+│   ├── app/                # Startup wiring, runtime orchestration
+│   ├── config/             # CLI parsing and config validation
+│   ├── exchange/           # Exchange registry wiring and credential mapping
+│   ├── spread/             # Rolling stats, BBO monitoring, signal generation
+│   └── trading/            # Trader state machine, execution, PnL tracking
+├── ecosystem.config.js     # PM2 process manager config
+├── .env.example            # Environment variable template
 └── .gitignore
 ```
 
