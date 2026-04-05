@@ -61,19 +61,25 @@ func TestSpreadStats_StdDevIsStableForLargeOffsets(t *testing.T) {
 
 func TestSpreadEngine_EmitSignalCallbackCanReenterEngine(t *testing.T) {
 	cfg := &appconfig.Config{
-		Symbol:         "BTC",
-		WindowSize:     10,
-		ZOpen:          -1,
-		MinProfitBps:   -1,
-		WarmupTicks:    1,
-		WarmupDuration: 0,
+		Symbol:               "BTC",
+		Quantity:             decimal.RequireFromString("1"),
+		LiquidityBufferRatio: 1,
+		WindowSize:           10,
+		ZOpen:                -1,
+		MinProfitBps:         -1,
+		WarmupTicks:          1,
+		WarmupDuration:       0,
 	}
 
-	engine := New(nil, nil, cfg, zap.NewNop().Sugar())
+	engine := New(cfg, zap.NewNop().Sugar())
 	engine.makerBid = decimal.RequireFromString("100")
 	engine.makerAsk = decimal.RequireFromString("101")
+	engine.makerBidQty = decimal.RequireFromString("2")
+	engine.makerAskQty = decimal.RequireFromString("2")
 	engine.takerBid = decimal.RequireFromString("102")
 	engine.takerAsk = decimal.RequireFromString("103")
+	engine.takerBidQty = decimal.RequireFromString("2")
+	engine.takerAskQty = decimal.RequireFromString("2")
 
 	done := make(chan struct{}, 1)
 	engine.SetSignalCallback(func(signal *Signal) {
@@ -101,6 +107,47 @@ func TestSpreadEngine_RoundTripFeeBpsMatchesExecutionPath(t *testing.T) {
 	want := (0.0001 + 0.0003 + 0.0005 + 0.0005) * 10000
 	if math.Abs(got-want) > 1e-12 {
 		t.Fatalf("RoundTripFeeBps = %.12f, want %.12f", got, want)
+	}
+}
+
+func TestSpreadEngine_SignalQuantityUsesSmallerBookSideWithBuffer(t *testing.T) {
+	cfg := &appconfig.Config{
+		Symbol:               "BTC",
+		Quantity:             decimal.RequireFromString("1.00000"),
+		LiquidityBufferRatio: 0.8,
+		WindowSize:           10,
+		ZOpen:                -1,
+		MinProfitBps:         -1,
+		WarmupTicks:          1,
+		WarmupDuration:       0,
+	}
+
+	engine := New(cfg, zap.NewNop().Sugar())
+	engine.SetFees(FeeInfo{}, FeeInfo{})
+	engine.makerBid = decimal.RequireFromString("100")
+	engine.makerAsk = decimal.RequireFromString("101")
+	engine.makerBidQty = decimal.RequireFromString("3")
+	engine.makerAskQty = decimal.RequireFromString("0.6")
+	engine.takerBid = decimal.RequireFromString("102")
+	engine.takerAsk = decimal.RequireFromString("103")
+	engine.takerBidQty = decimal.RequireFromString("0.5")
+	engine.takerAskQty = decimal.RequireFromString("4")
+	now := time.Now()
+	engine.makerTS = now
+	engine.takerTS = now
+
+	var got *Signal
+	engine.SetSignalCallback(func(signal *Signal) {
+		got = signal
+	})
+
+	engine.onBBOUpdate()
+
+	if got == nil {
+		t.Fatal("expected signal")
+	}
+	if !got.Quantity.Equal(decimal.RequireFromString("0.4")) {
+		t.Fatalf("signal quantity = %s, want 0.4", got.Quantity)
 	}
 }
 

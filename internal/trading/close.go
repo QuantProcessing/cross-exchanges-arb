@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
+	"github.com/QuantProcessing/exchanges/account"
 	"github.com/QuantProcessing/notify/telegram"
 	"github.com/shopspring/decimal"
 )
@@ -46,20 +47,40 @@ func (t *Trader) checkCloseConditions() {
 	}
 	t.mu.Unlock()
 
-	zAB, zBA := t.engine.CurrentZ()
+	if t.engine == nil {
+		return
+	}
 
 	var currentZ float64
-	if pos.Direction == spread.LongMakerShortTaker {
-		currentZ = zAB
-	} else {
-		currentZ = zBA
+	var (
+		currentSpread float64
+		meanSpread    float64
+		stddevSpread  float64
+		validSpread   bool
+	)
+	if snapshot := t.engine.Snapshot(); snapshot != nil {
+		if pos.Direction == spread.LongMakerShortTaker {
+			currentSpread = snapshot.SpreadAB
+			meanSpread = snapshot.MeanAB
+			stddevSpread = snapshot.StdDevAB
+			validSpread = snapshot.ValidAB
+		} else {
+			currentSpread = snapshot.SpreadBA
+			meanSpread = snapshot.MeanBA
+			stddevSpread = snapshot.StdDevBA
+			validSpread = snapshot.ValidBA
+		}
+	}
+	if stddevSpread > 1e-9 {
+		currentZ = (currentSpread - meanSpread) / stddevSpread
 	}
 
 	holdTime := time.Since(pos.OpenTime)
 	reason := ""
+	exitThreshold := meanSpread + t.config.ZClose*stddevSpread
 
-	if currentZ < t.config.ZClose {
-		reason = fmt.Sprintf("spread reverted (Z=%.2f < %.2f)", currentZ, t.config.ZClose)
+	if validSpread && currentSpread <= exitThreshold {
+		reason = fmt.Sprintf("spread reverted (spread=%.2fbps <= %.2fbps)", currentSpread, exitThreshold)
 	}
 	if currentZ < t.config.ZStop {
 		reason = fmt.Sprintf("stop loss (Z=%.2f < %.2f)", currentZ, t.config.ZStop)
@@ -71,8 +92,8 @@ func (t *Trader) checkCloseConditions() {
 	if reason == "" {
 		now := time.Now()
 		if t.lastLogTime.IsZero() || now.Sub(t.lastLogTime) >= 10*time.Second {
-			t.logger.Infof("%s 📊 hold  Z=%.2f (open=%.1fbps) %s",
-				t.roundTag(), currentZ, pos.OpenSpread, holdTime.Round(time.Second))
+			t.logger.Infof("%s 📊 hold  spread=%.2fbps exit=%.2fbps z=%.2f (open=%.1fbps) %s",
+				t.roundTag(), currentSpread, exitThreshold, currentZ, pos.OpenSpread, holdTime.Round(time.Second))
 			t.lastLogTime = now
 		}
 		return
@@ -95,12 +116,6 @@ func (t *Trader) closePosition(reason string) {
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second))
 
 	closeStart := time.Now()
-	if t.config.DryRun {
-		t.logger.Infof("%s 🔸 [DRY] close %s", t.roundTag(), pos.Direction)
-		t.finishSuccessfulClose()
-		return
-	}
-
 	closeCtx := t.ctx
 	if closeCtx == nil || closeCtx.Err() != nil {
 		closeCtx = context.Background()
@@ -115,10 +130,13 @@ func (t *Trader) closePosition(reason string) {
 	slippage := decimal.NewFromFloat(t.config.Slippage)
 
 	var longExchange, shortExchange exchanges.Exchange
+	var longAccount, shortAccount *account.TradingAccount
 	if pos.Direction == spread.LongMakerShortTaker {
 		longExchange, shortExchange = t.maker, t.taker
+		longAccount, shortAccount = t.makerAccount, t.takerAccount
 	} else {
 		longExchange, shortExchange = t.taker, t.maker
+		longAccount, shortAccount = t.takerAccount, t.makerAccount
 	}
 
 	var wg sync.WaitGroup
@@ -132,27 +150,35 @@ func (t *Trader) closePosition(reason string) {
 
 	go func() {
 		defer wg.Done()
-		order, err := longExchange.PlaceOrder(ctx, &exchanges.OrderParams{
+		submitAt := time.Now()
+		order, err := t.placeWSOrder(ctx, longAccount, &exchanges.OrderParams{
 			Symbol:     t.config.Symbol,
 			Side:       exchanges.OrderSideSell,
 			Type:       exchanges.OrderTypeMarket,
 			Quantity:   qty,
 			Slippage:   slippage,
 			ReduceOnly: true,
-		})
+		}, "close_long")
+		if err == nil {
+			t.registerOrderTrace("close_long", exchangeName(longExchange), order, submitAt, time.Now())
+		}
 		errCh <- closeLegResult{leg: "long", order: order, err: err}
 	}()
 
 	go func() {
 		defer wg.Done()
-		order, err := shortExchange.PlaceOrder(ctx, &exchanges.OrderParams{
+		submitAt := time.Now()
+		order, err := t.placeWSOrder(ctx, shortAccount, &exchanges.OrderParams{
 			Symbol:     t.config.Symbol,
 			Side:       exchanges.OrderSideBuy,
 			Type:       exchanges.OrderTypeMarket,
 			Quantity:   qty,
 			Slippage:   slippage,
 			ReduceOnly: true,
-		})
+		}, "close_short")
+		if err == nil {
+			t.registerOrderTrace("close_short", exchangeName(shortExchange), order, submitAt, time.Now())
+		}
 		errCh <- closeLegResult{leg: "short", order: order, err: err}
 	}()
 
@@ -170,6 +196,31 @@ func (t *Trader) closePosition(reason string) {
 		failures = append(failures, fmt.Sprintf("%s leg: %v", res.leg, res.err))
 	}
 
+	for _, leg := range []string{"long", "short"} {
+		res := results[leg]
+		if res.err != nil || res.order == nil {
+			continue
+		}
+
+		useMaker := false
+		if leg == "long" {
+			useMaker = pos.Direction == spread.LongMakerShortTaker
+		} else {
+			useMaker = pos.Direction == spread.LongTakerShortMaker
+		}
+
+		confirmed, verifyErr := t.verifyCloseLeg(ctx, res.order, t.makerOrderCh, t.takerOrderCh, useMaker)
+		if confirmed {
+			continue
+		}
+		if verifyErr == nil {
+			verifyErr = fmt.Errorf("close leg unconfirmed")
+		}
+		t.logger.Errorf("%s ❌ close %s leg unconfirmed: %v", t.roundTag(), leg, verifyErr)
+		results[leg] = closeLegResult{leg: leg, order: res.order, err: verifyErr}
+		failures = append(failures, fmt.Sprintf("%s leg: %v", leg, verifyErr))
+	}
+
 	if len(failures) > 0 {
 		failures = nil
 		t.logger.Infof("%s 🔄 retrying failed close legs", t.roundTag())
@@ -181,21 +232,26 @@ func (t *Trader) closePosition(reason string) {
 			if res.err == nil {
 				continue
 			}
-			var exchange exchanges.Exchange
 			var side exchanges.OrderSide
 			if leg == "long" {
-				exchange, side = longExchange, exchanges.OrderSideSell
+				side = exchanges.OrderSideSell
 			} else {
-				exchange, side = shortExchange, exchanges.OrderSideBuy
+				side = exchanges.OrderSideBuy
 			}
-			retryOrder, retryErr := exchange.PlaceOrder(retryCtx, &exchanges.OrderParams{
+			var accountRef *account.TradingAccount
+			if leg == "long" {
+				accountRef = longAccount
+			} else {
+				accountRef = shortAccount
+			}
+			retryOrder, retryErr := t.placeWSOrder(retryCtx, accountRef, &exchanges.OrderParams{
 				Symbol:     t.config.Symbol,
 				Side:       side,
 				Type:       exchanges.OrderTypeMarket,
 				Quantity:   qty,
 				Slippage:   slippage,
 				ReduceOnly: true,
-			})
+			}, "close_"+leg+"_retry")
 			if retryErr != nil {
 				t.logger.Errorf("%s ❌ %s leg retry: %v", t.roundTag(), leg, retryErr)
 				failures = append(failures, fmt.Sprintf("%s leg (retry): %v", leg, retryErr))
@@ -246,6 +302,7 @@ func (t *Trader) closePosition(reason string) {
 	longCloseOrder := t.refreshOrderForMetrics(ctx, longExchange, results["long"].order)
 	shortCloseOrder := t.refreshOrderForMetrics(ctx, shortExchange, results["short"].order)
 	t.logRealizedCloseMetrics(pos, longCloseOrder, shortCloseOrder)
+	t.logRoundRecap(pos, reason)
 
 	t.finishSuccessfulClose()
 
@@ -254,6 +311,43 @@ func (t *Trader) closePosition(reason string) {
 		time.Since(closeStart).Milliseconds())
 	go telegram.Notify(fmt.Sprintf("🔴 %s Closed\n%s\nHeld: %s",
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second)))
+}
+
+func (t *Trader) placeWSOrder(ctx context.Context, acc *account.TradingAccount, params *exchanges.OrderParams, phase string) (*exchanges.Order, error) {
+	if acc == nil {
+		return nil, fmt.Errorf("%s trading account is not configured", phase)
+	}
+	if params == nil {
+		return nil, fmt.Errorf("%s params are required", phase)
+	}
+	paramsCopy := *params
+	if paramsCopy.ClientID == "" {
+		paramsCopy.ClientID = exchanges.GenerateID()
+	}
+	flow, err := acc.PlaceWS(ctx, &paramsCopy)
+	if err != nil {
+		return nil, err
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	order, waitErr := flow.Wait(waitCtx, func(order *exchanges.Order) bool {
+		return order != nil && (order.OrderID != "" || order.Status != exchanges.OrderStatusPending)
+	})
+	if waitErr != nil {
+		order = flow.Latest()
+	}
+	if order != nil {
+		return order, nil
+	}
+	return &exchanges.Order{
+		ClientOrderID: paramsCopy.ClientID,
+		Symbol:        paramsCopy.Symbol,
+		Side:          paramsCopy.Side,
+		Type:          paramsCopy.Type,
+		Quantity:      paramsCopy.Quantity,
+		Status:        exchanges.OrderStatusPending,
+		ReduceOnly:    paramsCopy.ReduceOnly,
+	}, nil
 }
 
 func (t *Trader) verifyCloseLeg(ctx context.Context, order *exchanges.Order, makerCh, takerCh chan *exchanges.Order, useMaker bool) (bool, error) {
@@ -416,11 +510,23 @@ func mergeOrderDetails(dst, src *exchanges.Order) {
 	if dst.Quantity.IsZero() {
 		dst.Quantity = src.Quantity
 	}
+	if src.OrderPrice.GreaterThan(decimal.Zero) {
+		dst.OrderPrice = src.OrderPrice
+	}
 	if src.Price.GreaterThan(decimal.Zero) {
 		dst.Price = src.Price
 	}
+	if src.AverageFillPrice.GreaterThan(decimal.Zero) {
+		dst.AverageFillPrice = src.AverageFillPrice
+	}
+	if src.LastFillPrice.GreaterThan(decimal.Zero) {
+		dst.LastFillPrice = src.LastFillPrice
+	}
 	if src.FilledQuantity.GreaterThan(decimal.Zero) {
 		dst.FilledQuantity = src.FilledQuantity
+	}
+	if src.LastFillQuantity.GreaterThan(decimal.Zero) {
+		dst.LastFillQuantity = src.LastFillQuantity
 	}
 	if src.Fee.GreaterThan(decimal.Zero) {
 		dst.Fee = src.Fee
@@ -459,7 +565,7 @@ func (t *Trader) canStartNextRoundLocked(now time.Time) bool {
 	if t.state != StateIdle {
 		return false
 	}
-	if t.config != nil && !t.config.DryRun && t.config.LiveValidate && t.completedRounds >= t.config.MaxRounds {
+	if t.config != nil && t.completedRounds >= t.config.MaxRounds {
 		return false
 	}
 	return true
@@ -492,9 +598,7 @@ func (t *Trader) GracefulShutdown(timeout time.Duration) {
 		}
 	}
 
-	if !t.config.DryRun {
-		t.cancelAllOpenOrders(ctx)
-	}
+	t.cancelAllOpenOrders(ctx)
 
 	if pos != nil {
 		t.logger.Warnf("🛑 shutdown with open position, attempting forced close")
@@ -554,4 +658,24 @@ func (t *Trader) cancelAllOpenOrders(ctx context.Context) {
 			t.logger.Infof("🛑 cancelled all orders on %s", pair.name)
 		}
 	}
+}
+
+func exchangeName(ex exchanges.Exchange) string {
+	if ex == nil {
+		return ""
+	}
+	return ex.GetExchange()
+}
+
+func (t *Trader) logRoundRecap(pos *ArbPosition, reason string) {
+	if pos == nil || pos.OpenRecap == nil {
+		return
+	}
+
+	t.logger.Infof("%s 📚 round recap reason=%q hold=%s %s",
+		t.roundTag(),
+		reason,
+		time.Since(pos.OpenTime).Round(time.Millisecond),
+		pos.OpenRecap.Summary(),
+	)
 }

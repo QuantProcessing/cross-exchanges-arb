@@ -9,7 +9,7 @@ import (
 	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
-	"github.com/QuantProcessing/notify/telegram"
+	"github.com/QuantProcessing/exchanges/account"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
@@ -26,6 +26,7 @@ type ArbPosition struct {
 	ShortOrder         *exchanges.Order
 	LongExchange       string
 	ShortExchange      string
+	OpenRecap          *openTradeRecap
 }
 
 // MarketDataEngine is the subset of spread-engine behavior the trader depends on.
@@ -39,11 +40,13 @@ type MarketDataEngine interface {
 
 // Trader executes arbitrage trades based on signals from the spread engine.
 type Trader struct {
-	maker  exchanges.Exchange
-	taker  exchanges.Exchange
-	engine MarketDataEngine
-	config *appconfig.Config
-	logger *zap.SugaredLogger
+	maker        exchanges.Exchange
+	taker        exchanges.Exchange
+	makerAccount *account.TradingAccount
+	takerAccount *account.TradingAccount
+	engine       MarketDataEngine
+	config       *appconfig.Config
+	logger       *zap.SugaredLogger
 
 	mu              sync.Mutex
 	position        *ArbPosition
@@ -59,6 +62,9 @@ type Trader struct {
 	makerOrderCh    chan *exchanges.Order
 	takerOrderCh    chan *exchanges.Order
 	marketUpdateCh  chan struct{}
+	orderTraces     map[string]*orderTrace
+	makerOrdersSub  *account.Subscription[exchanges.Order]
+	takerOrdersSub  *account.Subscription[exchanges.Order]
 }
 
 var closeLegVerifyTimeout = 5 * time.Second
@@ -67,16 +73,19 @@ func (t *Trader) roundTag() string {
 	return fmt.Sprintf("R%03d", t.roundID)
 }
 
-func NewTrader(maker, taker exchanges.Exchange, engine MarketDataEngine, cfg *appconfig.Config, logger *zap.SugaredLogger) *Trader {
+func NewTrader(maker, taker exchanges.Exchange, makerAccount, takerAccount *account.TradingAccount, engine MarketDataEngine, cfg *appconfig.Config, logger *zap.SugaredLogger) *Trader {
 	tr := &Trader{
 		maker:          maker,
 		taker:          taker,
+		makerAccount:   makerAccount,
+		takerAccount:   takerAccount,
 		engine:         engine,
 		config:         cfg,
 		logger:         logger,
 		makerOrderCh:   make(chan *exchanges.Order, 100),
 		takerOrderCh:   make(chan *exchanges.Order, 100),
 		marketUpdateCh: make(chan struct{}, 1),
+		orderTraces:    make(map[string]*orderTrace),
 		state:          StateIdle,
 	}
 	if engine != nil {
@@ -92,66 +101,39 @@ func (t *Trader) SetPnLTracker(p *PnLTracker) {
 func (t *Trader) Start(ctx context.Context) error {
 	t.ctx = ctx
 
-	if !t.config.DryRun {
-		watchErrCh := make(chan error, 2)
-		startWatch := func(name string, ex exchanges.Exchange, out chan *exchanges.Order) {
-			go func() {
-				err := ex.WatchOrders(ctx, func(o *exchanges.Order) {
-					select {
-					case out <- o:
-					case <-ctx.Done():
-					}
-				})
-				if ctx.Err() != nil {
-					return
-				}
-				if err == nil {
-					t.logger.Debugf("%s WatchOrders registered in async mode", name)
-					return
-				}
-				err = fmt.Errorf("%s WatchOrders: %w", name, err)
-				select {
-				case watchErrCh <- err:
-				default:
-				}
-			}()
-		}
-
-		startWatch(t.config.MakerExchange, t.maker, t.makerOrderCh)
-		startWatch(t.config.TakerExchange, t.taker, t.takerOrderCh)
-
-		startupTimer := time.NewTimer(200 * time.Millisecond)
-		defer startupTimer.Stop()
-		select {
-		case err := <-watchErrCh:
-			return err
-		case <-startupTimer.C:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-
-		go t.monitorWatchOrderErrors(ctx, watchErrCh)
+	if t.makerAccount != nil {
+		t.makerOrdersSub = t.makerAccount.SubscribeOrders()
+		go t.forwardAccountOrders(ctx, t.config.MakerExchange, t.makerOrdersSub, t.makerOrderCh)
+	}
+	if t.takerAccount != nil {
+		t.takerOrdersSub = t.takerAccount.SubscribeOrders()
+		go t.forwardAccountOrders(ctx, t.config.TakerExchange, t.takerOrdersSub, t.takerOrderCh)
 	}
 
 	go t.monitorLoop(ctx)
 	return nil
 }
 
-func (t *Trader) monitorWatchOrderErrors(ctx context.Context, errCh <-chan error) {
+func (t *Trader) forwardAccountOrders(ctx context.Context, exchange string, sub *account.Subscription[exchanges.Order], out chan<- *exchanges.Order) {
+	if sub == nil {
+		return
+	}
+	defer sub.Unsubscribe()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case err := <-errCh:
-			if err == nil {
+		case order, ok := <-sub.C:
+			if !ok || order == nil {
 				continue
 			}
-			t.logger.Errorf("❌ order stream failed: %v", err)
-			go telegram.Notify(fmt.Sprintf("🚨 Order stream failed — manual intervention required\nErr: %v", err))
-			t.mu.Lock()
-			t.state = StateManualIntervention
-			t.mu.Unlock()
-			return
+			t.observeOrderUpdate(exchange, order)
+			select {
+			case out <- order:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }

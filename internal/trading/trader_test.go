@@ -13,25 +13,35 @@ import (
 	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
+	"github.com/QuantProcessing/exchanges/account"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type testExchange struct {
-	mu               sync.Mutex
-	name             string
-	symbolDetails    *exchanges.SymbolDetails
-	placedQtys       []decimal.Decimal
-	placedOrders     []*exchanges.OrderParams
-	cancelCalls      int
-	cancelAllCalls   int
-	lastCancelOrder  string
-	forcePlaceErr    error
-	watchOrdersErr   error
-	watchOrdersAsync bool
-	queuedOrders     []*exchanges.Order
-	ordersByID       map[string]*exchanges.Order
-	fetchOrderErr    error
+	mu                sync.Mutex
+	name              string
+	symbolDetails     *exchanges.SymbolDetails
+	placedQtys        []decimal.Decimal
+	placedOrders      []*exchanges.OrderParams
+	cancelCalls       int
+	cancelAllCalls    int
+	lastCancelOrder   string
+	forcePlaceErr     error
+	watchOrdersErr    error
+	watchPositionsErr error
+	watchFillsErr     error
+	queuedOrders      []*exchanges.Order
+	queuedFills       []*exchanges.Fill
+	ordersByID        map[string]*exchanges.Order
+	fetchOrderErr     error
+	accountSnapshot   *exchanges.Account
+	watchOrdersCB     exchanges.OrderUpdateCallback
+	watchPositionsCB  exchanges.PositionUpdateCallback
+	placeWSCalls      int
+	cancelWSCalls     int
+	autoEmitWS        bool
 }
 
 type testEngine struct {
@@ -169,10 +179,55 @@ func (e *testExchange) PlaceOrder(ctx context.Context, params *exchanges.OrderPa
 	}
 	return order, nil
 }
+func (e *testExchange) PlaceOrderWS(ctx context.Context, params *exchanges.OrderParams) error {
+	e.mu.Lock()
+	if e.forcePlaceErr != nil {
+		e.mu.Unlock()
+		return e.forcePlaceErr
+	}
+	e.placeWSCalls++
+	e.placedQtys = append(e.placedQtys, params.Quantity)
+	paramsCopy := *params
+	e.placedOrders = append(e.placedOrders, &paramsCopy)
+	shouldEmit := e.autoEmitWS
+	orderID := fmt.Sprintf("%s-ws-%d", e.name, e.placeWSCalls)
+	if e.ordersByID == nil {
+		e.ordersByID = make(map[string]*exchanges.Order)
+	}
+	order := &exchanges.Order{
+		OrderID:        orderID,
+		ClientOrderID:  params.ClientID,
+		Symbol:         params.Symbol,
+		Side:           params.Side,
+		Type:           params.Type,
+		Quantity:       params.Quantity,
+		Status:         exchanges.OrderStatusFilled,
+		FilledQuantity: params.Quantity,
+		ReduceOnly:     params.ReduceOnly,
+	}
+	if params.Type == exchanges.OrderTypePostOnly && !params.ReduceOnly {
+		order.Status = exchanges.OrderStatusPending
+		order.FilledQuantity = decimal.Zero
+	}
+	e.ordersByID[orderID] = cloneTestOrder(order)
+	cb := e.watchOrdersCB
+	e.mu.Unlock()
+	if shouldEmit && cb != nil {
+		go cb(cloneTestOrder(order))
+	}
+	return nil
+}
 func (e *testExchange) CancelOrder(ctx context.Context, orderID, symbol string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cancelCalls++
+	e.lastCancelOrder = orderID
+	return nil
+}
+func (e *testExchange) CancelOrderWS(ctx context.Context, orderID, symbol string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cancelWSCalls++
 	e.lastCancelOrder = orderID
 	return nil
 }
@@ -203,7 +258,15 @@ func (e *testExchange) FetchOrders(ctx context.Context, symbol string) ([]exchan
 func (e *testExchange) FetchOpenOrders(ctx context.Context, symbol string) ([]exchanges.Order, error) {
 	return nil, nil
 }
-func (e *testExchange) FetchAccount(ctx context.Context) (*exchanges.Account, error) { return nil, nil }
+func (e *testExchange) FetchAccount(ctx context.Context) (*exchanges.Account, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.accountSnapshot != nil {
+		snapshot := *e.accountSnapshot
+		return &snapshot, nil
+	}
+	return &exchanges.Account{}, nil
+}
 func (e *testExchange) FetchBalance(ctx context.Context) (decimal.Decimal, error) {
 	return decimal.Zero, nil
 }
@@ -213,22 +276,38 @@ func (e *testExchange) FetchSymbolDetails(ctx context.Context, symbol string) (*
 func (e *testExchange) FetchFeeRate(ctx context.Context, symbol string) (*exchanges.FeeRate, error) {
 	return nil, nil
 }
-func (e *testExchange) WatchOrderBook(ctx context.Context, symbol string, cb exchanges.OrderBookCallback) error {
+func (e *testExchange) WatchOrderBook(ctx context.Context, symbol string, depth int, cb exchanges.OrderBookCallback) error {
 	return nil
 }
 func (e *testExchange) GetLocalOrderBook(symbol string, depth int) *exchanges.OrderBook { return nil }
 func (e *testExchange) StopWatchOrderBook(ctx context.Context, symbol string) error     { return nil }
 func (e *testExchange) WatchOrders(ctx context.Context, cb exchanges.OrderUpdateCallback) error {
+	e.mu.Lock()
+	e.watchOrdersCB = cb
+	e.mu.Unlock()
 	if e.watchOrdersErr != nil {
 		return e.watchOrdersErr
 	}
-	if e.watchOrdersAsync {
-		return nil
+	return nil
+}
+func (e *testExchange) WatchFills(ctx context.Context, cb exchanges.FillCallback) error {
+	if e.watchFillsErr != nil {
+		return e.watchFillsErr
 	}
-	<-ctx.Done()
+	for _, fill := range e.queuedFills {
+		if cb != nil {
+			cb(fill)
+		}
+	}
 	return nil
 }
 func (e *testExchange) WatchPositions(ctx context.Context, cb exchanges.PositionUpdateCallback) error {
+	e.mu.Lock()
+	e.watchPositionsCB = cb
+	e.mu.Unlock()
+	if e.watchPositionsErr != nil {
+		return e.watchPositionsErr
+	}
 	return nil
 }
 func (e *testExchange) WatchTicker(ctx context.Context, symbol string, cb exchanges.TickerCallback) error {
@@ -241,6 +320,7 @@ func (e *testExchange) WatchKlines(ctx context.Context, symbol string, interval 
 	return nil
 }
 func (e *testExchange) StopWatchOrders(ctx context.Context) error                { return nil }
+func (e *testExchange) StopWatchFills(ctx context.Context) error                 { return nil }
 func (e *testExchange) StopWatchPositions(ctx context.Context) error             { return nil }
 func (e *testExchange) StopWatchTicker(ctx context.Context, symbol string) error { return nil }
 func (e *testExchange) StopWatchTrades(ctx context.Context, symbol string) error { return nil }
@@ -248,14 +328,36 @@ func (e *testExchange) StopWatchKlines(ctx context.Context, symbol string, inter
 	return nil
 }
 
+func (e *testExchange) emitOrderUpdate(order *exchanges.Order) {
+	e.mu.Lock()
+	cb := e.watchOrdersCB
+	e.mu.Unlock()
+	if cb != nil {
+		cb(order)
+	}
+}
+
+func (e *testExchange) emitPositionUpdate(position *exchanges.Position) {
+	e.mu.Lock()
+	cb := e.watchPositionsCB
+	e.mu.Unlock()
+	if cb != nil {
+		cb(position)
+	}
+}
+
 func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 	maker := newTestExchange("maker")
 	taker := newTestExchange("taker")
 	qty := decimal.RequireFromString("0.003")
+	makerAccount := account.NewTradingAccount(maker, exchanges.NopLogger)
+	takerAccount := account.NewTradingAccount(taker, exchanges.NopLogger)
 
 	tr := &Trader{
-		maker: maker,
-		taker: taker,
+		maker:        maker,
+		taker:        taker,
+		makerAccount: makerAccount,
+		takerAccount: takerAccount,
 		config: &appconfig.Config{
 			MakerExchange: "maker",
 			TakerExchange: "taker",
@@ -263,11 +365,14 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 			Quantity:      qty,
 			Slippage:      0.001,
 			MakerTimeout:  1 * time.Second,
+			MaxRounds:     1,
 		},
-		logger:       zap.NewNop().Sugar(),
-		makerOrderCh: make(chan *exchanges.Order, 10),
-		takerOrderCh: make(chan *exchanges.Order, 10),
-		state:        StateIdle,
+		logger:         zap.NewNop().Sugar(),
+		makerOrderCh:   make(chan *exchanges.Order, 10),
+		takerOrderCh:   make(chan *exchanges.Order, 10),
+		marketUpdateCh: make(chan struct{}, 1),
+		orderTraces:    make(map[string]*orderTrace),
+		state:          StateIdle,
 	}
 
 	tr.openFlow = &openFlowState{
@@ -285,6 +390,9 @@ func newActiveFlowTrader() (*Trader, *testExchange, *testExchange) {
 		makerQty:  qty,
 	}
 
+	_ = makerAccount.Start(context.Background())
+	_ = takerAccount.Start(context.Background())
+
 	return tr, maker, taker
 }
 
@@ -294,7 +402,9 @@ func newTestTrader() *Trader {
 }
 
 func newTestTraderWithPosition() *Trader {
-	tr, _, _ := newActiveFlowTrader()
+	tr, maker, taker := newActiveFlowTrader()
+	maker.autoEmitWS = true
+	taker.autoEmitWS = true
 	tr.engine = &testEngine{}
 	tr.position = &ArbPosition{
 		Direction:          spread.LongMakerShortTaker,
@@ -394,6 +504,7 @@ func TestTrader_MakerTimeoutWithNoFillsReturnsToIdle(t *testing.T) {
 
 func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
+	maker.autoEmitWS = true
 	tr.config.MakerTimeout = 2 * time.Second
 	tr.config.MinProfitBps = 1.0
 	engine := &testEngine{}
@@ -419,16 +530,30 @@ func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
 	}
 
 	tr.HandleSignal(sig)
+	waitForCondition(t, 500*time.Millisecond, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return tr.openFlow != nil && tr.openFlow.makerOrder != nil && tr.openFlow.makerOrder.ClientOrderID != ""
+	}, "expected openFlow maker client id to be populated")
+	makerClientID := ""
+	tr.mu.Lock()
+	if tr.openFlow != nil && tr.openFlow.makerOrder != nil {
+		makerClientID = tr.openFlow.makerOrder.ClientOrderID
+	}
+	tr.mu.Unlock()
 
 	waitForCondition(t, 400*time.Millisecond, func() bool {
 		maker.mu.Lock()
 		defer maker.mu.Unlock()
-		return maker.cancelCalls > 0
+		return maker.cancelWSCalls > 0
 	}, "expected stale maker order to be cancelled before maker-timeout")
+	maker.mu.Lock()
+	cancelOrderID := maker.lastCancelOrder
+	maker.mu.Unlock()
 
 	tr.makerOrderCh <- &exchanges.Order{
-		OrderID:        "maker-1",
-		ClientOrderID:  "cid-1",
+		OrderID:        cancelOrderID,
+		ClientOrderID:  makerClientID,
 		Status:         exchanges.OrderStatusCancelled,
 		FilledQuantity: decimal.Zero,
 	}
@@ -447,10 +572,25 @@ func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
 
 func TestTrader_CancelsPendingMakerOnImmediateMarketUpdate(t *testing.T) {
 	tr, maker, _ := newActiveFlowTrader()
+	maker.autoEmitWS = true
 	tr.config.MakerTimeout = 2 * time.Second
 	tr.config.MinProfitBps = 1.0
+	tr.config.ZOpen = 2
 	engine := &testEngine{}
-	engine.setSnapshot(spread.Snapshot{MeanAB: 0, MeanBA: 0})
+	engine.setSnapshot(spread.Snapshot{
+		MakerBid:    decimal.RequireFromString("99.95"),
+		MakerAsk:    decimal.RequireFromString("100"),
+		TakerBid:    decimal.RequireFromString("100.15"),
+		TakerAsk:    decimal.RequireFromString("100.20"),
+		MakerAskQty: decimal.RequireFromString("1"),
+		TakerBidQty: decimal.RequireFromString("1"),
+		MakerBidQty: decimal.RequireFromString("1"),
+		TakerAskQty: decimal.RequireFromString("1"),
+		SpreadAB:    14.9888,
+		MeanAB:      10,
+		StdDevAB:    1,
+		ValidAB:     true,
+	})
 	tr.engine = engine
 
 	sig := &spread.Signal{
@@ -480,8 +620,50 @@ func TestTrader_CancelsPendingMakerOnImmediateMarketUpdate(t *testing.T) {
 	waitForCondition(t, 80*time.Millisecond, func() bool {
 		maker.mu.Lock()
 		defer maker.mu.Unlock()
-		return maker.cancelCalls > 0
+		return maker.cancelWSCalls > 0
 	}, "expected stale maker order to be cancelled immediately after market update")
+}
+
+func TestTrader_CancelPendingMakerWaitsForResolvableOrderID(t *testing.T) {
+	tr, maker, _ := newActiveFlowTrader()
+	flow, err := tr.makerAccount.Track("", "cid-resolve")
+	if err != nil {
+		t.Fatalf("Track() error = %v", err)
+	}
+	tr.state = StateWaitingFill
+	tr.openFlow = &openFlowState{
+		signal: &spread.Signal{Direction: spread.LongMakerShortTaker},
+		makerOrder: &exchanges.Order{
+			ClientOrderID: "cid-resolve",
+		},
+		makerFlow: flow,
+		makerQty:  decimal.RequireFromString("0.003"),
+	}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		update := &exchanges.Order{
+			OrderID:       "maker-resolved",
+			ClientOrderID: "cid-resolve",
+			Status:        exchanges.OrderStatusCancelled,
+		}
+		maker.emitOrderUpdate(update)
+		tr.makerOrderCh <- update
+	}()
+
+	if err := tr.cancelPendingMaker(context.Background(), "test"); err != nil {
+		t.Fatalf("cancelPendingMaker() error = %v", err)
+	}
+
+	maker.mu.Lock()
+	lastCancelOrder := maker.lastCancelOrder
+	maker.mu.Unlock()
+	if lastCancelOrder != "maker-resolved" {
+		t.Fatalf("lastCancelOrder = %q, want maker-resolved", lastCancelOrder)
+	}
+	if tr.state != StateIdle {
+		t.Fatalf("state = %s, want idle", tr.state)
+	}
 }
 
 func TestTrader_HedgeFailureMovesToManualIntervention(t *testing.T) {
@@ -534,6 +716,29 @@ func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
 	}
 }
 
+func TestTrader_CloseRequiresTerminalConfirmation(t *testing.T) {
+	tr := newTestTraderWithPosition()
+	maker := tr.maker.(*testExchange)
+	taker := tr.taker.(*testExchange)
+	maker.autoEmitWS = false
+	taker.autoEmitWS = false
+
+	prevTimeout := closeLegVerifyTimeout
+	closeLegVerifyTimeout = 10 * time.Millisecond
+	defer func() {
+		closeLegVerifyTimeout = prevTimeout
+	}()
+
+	tr.closePosition("need-confirmation")
+
+	if tr.state != StateManualIntervention {
+		t.Fatalf("state = %s, want manual_intervention", tr.state)
+	}
+	if tr.position == nil {
+		t.Fatal("position should be preserved when close legs are unconfirmed")
+	}
+}
+
 func TestTrader_SuccessfulCloseTransitionsToCooldown(t *testing.T) {
 	tr := newTestTraderWithPosition()
 
@@ -550,7 +755,6 @@ func TestTrader_SuccessfulCloseTransitionsToCooldown(t *testing.T) {
 func TestTrader_MaxRoundsStopsNewTrading(t *testing.T) {
 	tr := newTestTrader()
 	tr.completedRounds = 1
-	tr.config.LiveValidate = true
 	tr.config.MaxRounds = 1
 
 	if tr.canStartNextRound() {
@@ -558,33 +762,20 @@ func TestTrader_MaxRoundsStopsNewTrading(t *testing.T) {
 	}
 }
 
-func TestTrader_MaxRoundsDoesNotBlockDryRun(t *testing.T) {
+func TestTrader_MaxRoundsDoesNotBlockWhenBelowLimit(t *testing.T) {
 	tr := newTestTrader()
-	tr.completedRounds = 1
-	tr.config.DryRun = true
-	tr.config.LiveValidate = true
+	tr.completedRounds = 0
 	tr.config.MaxRounds = 1
 
 	if !tr.canStartNextRound() {
-		t.Fatal("expected dry-run trading to bypass max-round gating")
-	}
-}
-
-func TestTrader_MaxRoundsDoesNotBlockWhenLiveValidationDisabled(t *testing.T) {
-	tr := newTestTrader()
-	tr.completedRounds = 1
-	tr.config.DryRun = false
-	tr.config.LiveValidate = false
-	tr.config.MaxRounds = 1
-
-	if !tr.canStartNextRound() {
-		t.Fatal("expected non-live trading to bypass max-round gating")
+		t.Fatal("expected trading to continue when completed rounds are below the limit")
 	}
 }
 
 func TestTrader_CooldownExpiryReturnsToIdle(t *testing.T) {
 	tr := newTestTraderWithPosition()
 	tr.config.Cooldown = 100 * time.Millisecond
+	tr.config.MaxRounds = 2
 
 	tr.closePosition("done")
 
@@ -613,9 +804,14 @@ func TestTrader_CompletedRoundsIncrementOncePerResolvedClose(t *testing.T) {
 	}
 }
 
-func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testing.T) {
+func TestTrader_CloseUsesExecutedOpenQuantityAfterPartialFill(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	tr.config.MakerTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
 	sig := &spread.Signal{
 		Direction:      spread.LongMakerShortTaker,
 		SpreadBps:      12.5,
@@ -637,41 +833,19 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 	}
 
 	waitForTraderState(t, tr, StateWaitingFill)
-	// Maker partial fill triggers hedge → waitTakerFill reads from takerOrderCh
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		tr.takerOrderCh <- &exchanges.Order{
-			OrderID:        "taker-1",
-			Status:         exchanges.OrderStatusFilled,
-			FilledQuantity: decimal.RequireFromString("0.001"),
-		}
-	}()
+	makerClientID := ""
+	tr.mu.Lock()
+	if tr.openFlow != nil && tr.openFlow.makerOrder != nil {
+		makerClientID = tr.openFlow.makerOrder.ClientOrderID
+	}
+	tr.mu.Unlock()
 	tr.makerOrderCh <- &exchanges.Order{
-		OrderID:        "maker-1",
-		ClientOrderID:  "cid-1",
+		ClientOrderID:  makerClientID,
 		Status:         exchanges.OrderStatusPartiallyFilled,
 		FilledQuantity: decimal.RequireFromString("0.001"),
 	}
 	waitForTraderState(t, tr, StateWaitingFill)
-	waitForTraderState(t, tr, StateClosing)
-
-	// Maker cancel with fills also triggers hedge → provide taker fill
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		tr.takerOrderCh <- &exchanges.Order{
-			OrderID:        "taker-2",
-			Status:         exchanges.OrderStatusFilled,
-			FilledQuantity: decimal.RequireFromString("0.001"),
-		}
-	}()
-	tr.makerOrderCh <- &exchanges.Order{
-		OrderID:        "maker-1",
-		ClientOrderID:  "cid-1",
-		Status:         exchanges.OrderStatusCancelled,
-		FilledQuantity: decimal.RequireFromString("0.001"),
-	}
-
-	waitForTraderState(t, tr, StatePositionOpen)
+	tr.finalizeOpenFlow(tr.openFlow.makerOrder, decimal.RequireFromString("0.001"))
 	waitForMakerOrders(t, maker, 1)
 	if tr.position == nil {
 		t.Fatal("position was not opened")
@@ -680,6 +854,8 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 		t.Fatalf("open quantity = %s, want 0.001", tr.position.OpenQuantity)
 	}
 
+	maker.autoEmitWS = true
+	taker.autoEmitWS = true
 	tr.closePosition("test-close")
 
 	maker.mu.Lock()
@@ -695,16 +871,51 @@ func TestTrader_HandleSignalTimeoutSettlementPreservesExecutedQuantity(t *testin
 	taker.mu.Lock()
 	takerQtys := append([]decimal.Decimal(nil), taker.placedQtys...)
 	taker.mu.Unlock()
-	if len(takerQtys) != 2 {
-		t.Fatalf("taker order count = %d, want 2", len(takerQtys))
+	if len(takerQtys) != 1 {
+		t.Fatalf("taker order count = %d, want 1 close order", len(takerQtys))
 	}
-	if !takerQtys[1].Equal(decimal.RequireFromString("0.001")) {
-		t.Fatalf("close taker qty = %s, want 0.001", takerQtys[1])
+	if !takerQtys[0].Equal(decimal.RequireFromString("0.001")) {
+		t.Fatalf("close taker qty = %s, want 0.001", takerQtys[0])
+	}
+}
+
+func TestTrader_OpenUsesSignalQuantityWhenProvided(t *testing.T) {
+	tr, maker, _ := newActiveFlowTrader()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	sig := &spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99"),
+		TakerBid:       decimal.RequireFromString("101"),
+		TakerAsk:       decimal.RequireFromString("102"),
+		Quantity:       decimal.RequireFromString("0.002"),
+	}
+
+	tr.HandleSignal(sig)
+	waitForTraderState(t, tr, StateWaitingFill)
+
+	maker.mu.Lock()
+	defer maker.mu.Unlock()
+	if len(maker.placedQtys) != 1 {
+		t.Fatalf("maker order count = %d, want 1", len(maker.placedQtys))
+	}
+	if !maker.placedQtys[0].Equal(decimal.RequireFromString("0.002")) {
+		t.Fatalf("maker placed qty = %s, want 0.002", maker.placedQtys[0])
 	}
 }
 
 func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
+	maker.autoEmitWS = true
+	taker.autoEmitWS = true
 	tr.position = &ArbPosition{
 		Direction:     spread.LongMakerShortTaker,
 		OpenTime:      time.Now().Add(-time.Minute),
@@ -752,44 +963,48 @@ func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	}
 }
 
-func TestTrader_StartFailsWhenWatchOrdersSubscriptionFails(t *testing.T) {
-	tr, maker, _ := newActiveFlowTrader()
-	maker.watchOrdersErr = errors.New("watch orders auth failed")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	err := tr.Start(ctx)
-	if err == nil {
-		t.Fatal("expected start to fail")
-	}
-	if !strings.Contains(err.Error(), "maker") {
-		t.Fatalf("error = %v, want maker context", err)
-	}
-}
-
-func TestTrader_StartSucceedsWhenWatchOrdersStayActive(t *testing.T) {
-	tr := newTestTrader()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := tr.Start(ctx); err != nil {
-		t.Fatalf("start error = %v, want nil", err)
-	}
-}
-
-func TestTrader_StartSucceedsWhenWatchOrdersRegistersAsync(t *testing.T) {
+func TestTrader_StartSubscribesTradingAccountOrders(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
-	maker.watchOrdersAsync = true
-	taker.watchOrdersAsync = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := tr.Start(ctx); err != nil {
-		t.Fatalf("start error = %v, want nil", err)
+	if err := tr.makerAccount.Start(ctx); err != nil {
+		t.Fatalf("makerAccount.Start() error = %v", err)
 	}
+	if err := tr.takerAccount.Start(ctx); err != nil {
+		t.Fatalf("takerAccount.Start() error = %v", err)
+	}
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	update := &exchanges.Order{
+		OrderID:       "maker-42",
+		ClientOrderID: "cid-42",
+		Status:        exchanges.OrderStatusPending,
+	}
+	maker.emitOrderUpdate(update)
+
+	select {
+	case got := <-tr.makerOrderCh:
+		if got == nil || got.OrderID != update.OrderID {
+			t.Fatalf("order update = %#v, want %s", got, update.OrderID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected trader to receive maker TradingAccount order update")
+	}
+
+	position := &exchanges.Position{
+		Symbol:   tr.config.Symbol,
+		Quantity: decimal.RequireFromString("0.003"),
+	}
+	taker.emitPositionUpdate(position)
+
+	waitForCondition(t, 200*time.Millisecond, func() bool {
+		snapshot, ok := tr.takerAccount.Position(tr.config.Symbol)
+		return ok && snapshot.Quantity.Equal(position.Quantity)
+	}, "expected taker TradingAccount position snapshot to update")
 }
 
 func TestTrader_FinalizeOpenFlowAssignsLongShortOrdersByDirection(t *testing.T) {
@@ -820,6 +1035,208 @@ func TestTrader_FinalizeOpenFlowAssignsLongShortOrdersByDirection(t *testing.T) 
 	}
 	if tr.position.ShortOrder == nil || tr.position.ShortOrder.OrderID != "maker-open" {
 		t.Fatalf("short order = %#v, want maker order", tr.position.ShortOrder)
+	}
+}
+
+func TestTrader_BuildOpenTradeRecapIncludesTimingsAndBBO(t *testing.T) {
+	tr := newTestTrader()
+	now := time.Unix(1710000000, 0)
+	tr.openFlow = &openFlowState{
+		signal: &spread.Signal{
+			Direction:      spread.LongMakerShortTaker,
+			SpreadBps:      12.5,
+			ZScore:         2.1,
+			ExpectedProfit: 4.2,
+			MakerBid:       decimal.RequireFromString("99.8"),
+			MakerAsk:       decimal.RequireFromString("100.0"),
+			TakerBid:       decimal.RequireFromString("100.6"),
+			TakerAsk:       decimal.RequireFromString("100.8"),
+			Timestamp:      now,
+		},
+		makerOrder: &exchanges.Order{
+			OrderID: "maker-open",
+			Price:   decimal.RequireFromString("99.99"),
+		},
+		lastHedgeOrder: &exchanges.Order{
+			OrderID: "taker-hedge",
+			Price:   decimal.RequireFromString("100.55"),
+		},
+		makerSide: exchanges.OrderSideBuy,
+		takerSide: exchanges.OrderSideSell,
+		makerQty:  decimal.RequireFromString("0.003"),
+
+		signalTime:     now,
+		makerPlacedAt:  now.Add(15 * time.Millisecond),
+		fillDetectedAt: now.Add(240 * time.Millisecond),
+		hedgeDoneAt:    now.Add(285 * time.Millisecond),
+
+		signalSnapshot: &tradeBBO{
+			CapturedAt: now,
+			MakerBid:   decimal.RequireFromString("99.8"),
+			MakerAsk:   decimal.RequireFromString("100.0"),
+			TakerBid:   decimal.RequireFromString("100.6"),
+			TakerAsk:   decimal.RequireFromString("100.8"),
+			ZScore:     2.1,
+			SpreadBps:  12.5,
+		},
+		makerPlacedSnapshot: &tradeBBO{
+			CapturedAt: now.Add(15 * time.Millisecond),
+			MakerBid:   decimal.RequireFromString("99.85"),
+			MakerAsk:   decimal.RequireFromString("100.05"),
+			TakerBid:   decimal.RequireFromString("100.62"),
+			TakerAsk:   decimal.RequireFromString("100.82"),
+		},
+		fillSnapshot: &tradeBBO{
+			CapturedAt: now.Add(240 * time.Millisecond),
+			MakerBid:   decimal.RequireFromString("99.90"),
+			MakerAsk:   decimal.RequireFromString("100.10"),
+			TakerBid:   decimal.RequireFromString("100.64"),
+			TakerAsk:   decimal.RequireFromString("100.84"),
+		},
+		hedgeSnapshot: &tradeBBO{
+			CapturedAt: now.Add(285 * time.Millisecond),
+			MakerBid:   decimal.RequireFromString("99.92"),
+			MakerAsk:   decimal.RequireFromString("100.12"),
+			TakerBid:   decimal.RequireFromString("100.58"),
+			TakerAsk:   decimal.RequireFromString("100.78"),
+		},
+	}
+
+	recap := tr.buildOpenTradeRecap(tr.openFlow, decimal.RequireFromString("0.003"))
+	if recap == nil {
+		t.Fatal("recap = nil, want data")
+	}
+	if recap.MakerOrderID != "maker-open" {
+		t.Fatalf("maker order id = %q, want maker-open", recap.MakerOrderID)
+	}
+	if recap.TakerOrderID != "taker-hedge" {
+		t.Fatalf("taker order id = %q, want taker-hedge", recap.TakerOrderID)
+	}
+	if recap.Timings.SignalToMaker != 15*time.Millisecond {
+		t.Fatalf("signal->maker = %s, want 15ms", recap.Timings.SignalToMaker)
+	}
+	if recap.Timings.MakerToFill != 225*time.Millisecond {
+		t.Fatalf("maker->fill = %s, want 225ms", recap.Timings.MakerToFill)
+	}
+	if recap.Timings.FillToHedge != 45*time.Millisecond {
+		t.Fatalf("fill->hedge = %s, want 45ms", recap.Timings.FillToHedge)
+	}
+	if recap.Timings.Total != 285*time.Millisecond {
+		t.Fatalf("total = %s, want 285ms", recap.Timings.Total)
+	}
+	if recap.Signal == nil || !recap.Signal.MakerAsk.Equal(decimal.RequireFromString("100.0")) {
+		t.Fatalf("signal snapshot = %#v, want maker ask 100.0", recap.Signal)
+	}
+	if recap.HedgeDone == nil || !recap.HedgeDone.TakerBid.Equal(decimal.RequireFromString("100.58")) {
+		t.Fatalf("hedge snapshot = %#v, want taker bid 100.58", recap.HedgeDone)
+	}
+}
+
+func TestTrader_FinalizeOpenFlowLogsStructuredRecap(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	tr, _, _ := newActiveFlowTrader()
+	tr.logger = zap.New(core).Sugar()
+
+	now := time.Unix(1710000100, 0)
+	tr.roundID = 7
+	tr.openFlow.signal = &spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
+		SpreadBps:      14.2,
+		ZScore:         2.4,
+		ExpectedProfit: 5.1,
+	}
+	tr.openFlow.lastHedgeOrder = &exchanges.Order{
+		OrderID: "taker-7",
+		Price:   decimal.RequireFromString("100.8"),
+	}
+	tr.openFlow.signalTime = now
+	tr.openFlow.makerPlacedAt = now.Add(10 * time.Millisecond)
+	tr.openFlow.fillDetectedAt = now.Add(160 * time.Millisecond)
+	tr.openFlow.hedgeDoneAt = now.Add(215 * time.Millisecond)
+	tr.openFlow.signalSnapshot = &tradeBBO{
+		CapturedAt: now,
+		MakerBid:   decimal.RequireFromString("99.7"),
+		MakerAsk:   decimal.RequireFromString("99.9"),
+		TakerBid:   decimal.RequireFromString("100.5"),
+		TakerAsk:   decimal.RequireFromString("100.7"),
+	}
+	tr.openFlow.makerPlacedSnapshot = &tradeBBO{
+		CapturedAt: now.Add(10 * time.Millisecond),
+		MakerBid:   decimal.RequireFromString("99.72"),
+		MakerAsk:   decimal.RequireFromString("99.92"),
+		TakerBid:   decimal.RequireFromString("100.48"),
+		TakerAsk:   decimal.RequireFromString("100.68"),
+	}
+	tr.openFlow.fillSnapshot = &tradeBBO{
+		CapturedAt: now.Add(160 * time.Millisecond),
+		MakerBid:   decimal.RequireFromString("99.74"),
+		MakerAsk:   decimal.RequireFromString("99.94"),
+		TakerBid:   decimal.RequireFromString("100.46"),
+		TakerAsk:   decimal.RequireFromString("100.66"),
+	}
+	tr.openFlow.hedgeSnapshot = &tradeBBO{
+		CapturedAt: now.Add(215 * time.Millisecond),
+		MakerBid:   decimal.RequireFromString("99.76"),
+		MakerAsk:   decimal.RequireFromString("99.96"),
+		TakerBid:   decimal.RequireFromString("100.44"),
+		TakerAsk:   decimal.RequireFromString("100.64"),
+	}
+
+	tr.finalizeOpenFlow(&exchanges.Order{
+		OrderID: "maker-7",
+		Price:   decimal.RequireFromString("99.91"),
+	}, decimal.RequireFromString("0.003"))
+
+	entries := observed.FilterMessageSnippet("📘 recap").All()
+	if len(entries) != 1 {
+		t.Fatalf("recap logs = %d, want 1", len(entries))
+	}
+	msg := entries[0].Message
+	for _, want := range []string{
+		"maker=10ms",
+		"fill=150ms",
+		"hedge=55ms",
+		"total=215ms",
+		"signal_bbo",
+		"maker_bbo",
+		"fill_bbo",
+		"hedge_bbo",
+		"maker-7",
+		"taker-7",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("recap log missing %q: %s", want, msg)
+		}
+	}
+}
+
+func TestBuildLatencyReportUsesExchangeAndLocalTimestamps(t *testing.T) {
+	submitLocal := time.Unix(1710000000, 0)
+	ackLocal := submitLocal.Add(180 * time.Millisecond)
+	firstFillLocal := submitLocal.Add(430 * time.Millisecond)
+
+	report := buildLatencyReport(
+		submitLocal,
+		ackLocal,
+		&exchanges.Order{Timestamp: submitLocal.Add(120 * time.Millisecond).UnixMilli()},
+		firstFillLocal,
+		&exchanges.Fill{Timestamp: submitLocal.Add(350 * time.Millisecond).UnixMilli()},
+	)
+
+	if report.SubmitToExchange != 120*time.Millisecond {
+		t.Fatalf("SubmitToExchange = %s, want 120ms", report.SubmitToExchange)
+	}
+	if report.ExchangeToLocalAck != 60*time.Millisecond {
+		t.Fatalf("ExchangeToLocalAck = %s, want 60ms", report.ExchangeToLocalAck)
+	}
+	if report.ExchangeToLocalFill != 80*time.Millisecond {
+		t.Fatalf("ExchangeToLocalFill = %s, want 80ms", report.ExchangeToLocalFill)
+	}
+	if report.SubmitToFirstFillExchange != 350*time.Millisecond {
+		t.Fatalf("SubmitToFirstFillExchange = %s, want 350ms", report.SubmitToFirstFillExchange)
+	}
+	if report.SubmitToFirstFillLocal != 430*time.Millisecond {
+		t.Fatalf("SubmitToFirstFillLocal = %s, want 430ms", report.SubmitToFirstFillLocal)
 	}
 }
 

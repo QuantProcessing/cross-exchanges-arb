@@ -1,32 +1,32 @@
 package spread
 
 import (
-	"context"
-	"encoding/csv"
-	"fmt"
-	"os"
 	"sync"
 	"time"
 
 	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
-	exchanges "github.com/QuantProcessing/exchanges"
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/marketdata"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
 
 // Engine monitors BBO from two exchanges and detects arbitrage signals.
 type Engine struct {
-	maker  exchanges.Exchange
-	taker  exchanges.Exchange
 	symbol string
 	config *appconfig.Config
 	logger *zap.SugaredLogger
 
-	mu       sync.Mutex
-	makerBid decimal.Decimal
-	makerAsk decimal.Decimal
-	takerBid decimal.Decimal
-	takerAsk decimal.Decimal
+	mu          sync.Mutex
+	makerBid    decimal.Decimal
+	makerAsk    decimal.Decimal
+	takerBid    decimal.Decimal
+	takerAsk    decimal.Decimal
+	makerBidQty decimal.Decimal
+	makerAskQty decimal.Decimal
+	takerBidQty decimal.Decimal
+	takerAskQty decimal.Decimal
+	makerTS     time.Time
+	takerTS     time.Time
 
 	// Rolling stats for both directions
 	statsAB *Stats // spread: takerBid - makerAsk (Long Maker, Short Taker)
@@ -44,17 +44,11 @@ type Engine struct {
 	// Signal callback
 	onSignal       func(signal *Signal)
 	onMarketUpdate func()
-
-	// CSV writer for observe-only mode
-	csvWriter *csv.Writer
-	csvFile   *os.File
 }
 
 // New creates a new spread engine.
-func New(maker, taker exchanges.Exchange, cfg *appconfig.Config, logger *zap.SugaredLogger) *Engine {
+func New(cfg *appconfig.Config, logger *zap.SugaredLogger) *Engine {
 	return &Engine{
-		maker:   maker,
-		taker:   taker,
 		symbol:  cfg.Symbol,
 		config:  cfg,
 		logger:  logger,
@@ -95,100 +89,55 @@ func (e *Engine) RoundTripFeeBps() float64 {
 	return (e.makerFee.MakerRate + e.makerFee.TakerRate + e.takerFee.TakerRate + e.takerFee.TakerRate) * 10000
 }
 
-// Start begins monitoring spread via WatchOrderBook on both exchanges.
-func (e *Engine) Start(ctx context.Context) error {
-	// Setup CSV writer for observe-only mode
-	if e.config.ObserveOnly {
-		filename := fmt.Sprintf("spread_%s_%s_%s_%s.csv",
-			e.config.MakerExchange, e.config.TakerExchange, e.symbol,
-			time.Now().Format("20060102_150405"))
-		f, err := os.Create(filename)
-		if err != nil {
-			return fmt.Errorf("create CSV: %w", err)
-		}
-		e.csvFile = f
-		e.csvWriter = csv.NewWriter(f)
-		e.csvWriter.Write([]string{
-			"timestamp", "maker_bid", "maker_ask", "taker_bid", "taker_ask",
-			"spread_ab_bps", "spread_ba_bps",
-			"mean_ab", "stddev_ab", "z_ab",
-			"mean_ba", "stddev_ba", "z_ba",
-		})
-		e.logger.Infow("observe-only mode: writing to CSV", "file", filename)
-	}
-
-	// Subscribe to orderbooks
-	errCh := make(chan error, 2)
-
-	go func() {
-		err := e.maker.WatchOrderBook(ctx, e.symbol, func(ob *exchanges.OrderBook) {
-			if len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-				return
-			}
-			e.mu.Lock()
-			e.makerBid = ob.Bids[0].Price
-			e.makerAsk = ob.Asks[0].Price
-			e.mu.Unlock()
-			e.onBBOUpdate()
-		})
-		if err != nil {
-			errCh <- fmt.Errorf("maker WatchOrderBook: %w", err)
-		}
-	}()
-
-	go func() {
-		err := e.taker.WatchOrderBook(ctx, e.symbol, func(ob *exchanges.OrderBook) {
-			if len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-				return
-			}
-			e.mu.Lock()
-			e.takerBid = ob.Bids[0].Price
-			e.takerAsk = ob.Asks[0].Price
-			e.mu.Unlock()
-			e.onBBOUpdate()
-		})
-		if err != nil {
-			errCh <- fmt.Errorf("taker WatchOrderBook: %w", err)
-		}
-	}()
-
-	// Wait for first error or context done
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+// OnMarketFrame applies a bilateral market snapshot emitted by the shared
+// marketdata service.
+func (e *Engine) OnMarketFrame(frame marketdata.MarketFrame) {
+	e.mu.Lock()
+	e.makerBid, e.makerBidQty = firstLevel(frame.MakerBook.Bids)
+	e.makerAsk, e.makerAskQty = firstLevel(frame.MakerBook.Asks)
+	e.takerBid, e.takerBidQty = firstLevel(frame.TakerBook.Bids)
+	e.takerAsk, e.takerAskQty = firstLevel(frame.TakerBook.Asks)
+	e.makerTS = frame.MakerExchangeTS
+	e.takerTS = frame.TakerExchangeTS
+	e.mu.Unlock()
+	e.onBBOUpdate()
 }
 
 // Close cleans up resources.
 func (e *Engine) Close() {
-	if e.csvWriter != nil {
-		e.csvWriter.Flush()
-	}
-	if e.csvFile != nil {
-		e.csvFile.Close()
-	}
 }
 
 // onBBOUpdate is called whenever either exchange's BBO updates.
 // It is called concurrently from maker and taker WatchOrderBook goroutines.
 func (e *Engine) onBBOUpdate() {
 	e.mu.Lock()
-	makerBid := e.makerBid
-	makerAsk := e.makerAsk
-	takerBid := e.takerBid
-	takerAsk := e.takerAsk
+	makerRaw := TopOfBook{
+		BidPrice:  e.makerBid,
+		BidQty:    e.makerBidQty,
+		AskPrice:  e.makerAsk,
+		AskQty:    e.makerAskQty,
+		Timestamp: e.makerTS,
+	}
+	takerRaw := TopOfBook{
+		BidPrice:  e.takerBid,
+		BidQty:    e.takerBidQty,
+		AskPrice:  e.takerAsk,
+		AskQty:    e.takerAskQty,
+		Timestamp: e.takerTS,
+	}
 	e.mu.Unlock()
 
+	maker := SanitizeTopOfBook(makerRaw)
+	taker := SanitizeTopOfBook(takerRaw)
+
 	// Need all four prices
-	if makerBid.IsZero() || makerAsk.IsZero() || takerBid.IsZero() || takerAsk.IsZero() {
+	if maker.BidPrice.IsZero() || maker.AskPrice.IsZero() || taker.BidPrice.IsZero() || taker.AskPrice.IsZero() {
 		return
 	}
 
 	// Calculate mid price for normalization
-	makerMid := makerBid.Add(makerAsk).Div(decimal.NewFromInt(2))
-	takerMid := takerBid.Add(takerAsk).Div(decimal.NewFromInt(2))
+	makerMid := maker.BidPrice.Add(maker.AskPrice).Div(decimal.NewFromInt(2))
+	takerMid := taker.BidPrice.Add(taker.AskPrice).Div(decimal.NewFromInt(2))
 	midPrice := makerMid.Add(takerMid).Div(decimal.NewFromInt(2))
 
 	if midPrice.IsZero() {
@@ -205,9 +154,9 @@ func (e *Engine) onBBOUpdate() {
 
 	// Calculate spreads in BPS
 	// AB: takerBid - makerAsk → if positive, can buy on maker, sell on taker
-	spreadAB, _ := takerBid.Sub(makerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
+	spreadAB, _ := taker.BidPrice.Sub(maker.AskPrice).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
 	// BA: makerBid - takerAsk → if positive, can buy on taker, sell on maker
-	spreadBA, _ := makerBid.Sub(takerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
+	spreadBA, _ := maker.BidPrice.Sub(taker.AskPrice).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
 
 	// Protect warmup tracking and stats with the engine mutex to avoid data races
 	// between concurrent maker/taker WatchOrderBook goroutines.
@@ -240,24 +189,7 @@ func (e *Engine) onBBOUpdate() {
 	stddevBA := e.statsBA.StdDev()
 	e.mu.Unlock()
 
-	// CSV output for observe-only mode (outside lock)
 	e.emitMarketUpdate()
-	if e.csvWriter != nil {
-		if err := e.csvWriter.Write([]string{
-			now.Format(time.RFC3339Nano),
-			makerBid.String(), makerAsk.String(),
-			takerBid.String(), takerAsk.String(),
-			fmt.Sprintf("%.4f", spreadAB), fmt.Sprintf("%.4f", spreadBA),
-			fmt.Sprintf("%.4f", meanAB), fmt.Sprintf("%.4f", stddevAB), fmt.Sprintf("%.4f", zAB),
-			fmt.Sprintf("%.4f", meanBA), fmt.Sprintf("%.4f", stddevBA), fmt.Sprintf("%.4f", zBA),
-		}); err != nil {
-			e.logger.Warnw("CSV write failed", "err", err)
-		}
-		// Flush CSV periodically to prevent data loss
-		if tickCount%100 == 0 {
-			e.csvWriter.Flush()
-		}
-	}
 
 	// Log periodic status (outside lock)
 	if warmedUp && tickCount%200 == 0 {
@@ -265,50 +197,68 @@ func (e *Engine) onBBOUpdate() {
 			spreadAB, zAB, spreadBA, zBA, meanAB, stddevAB)
 	}
 
-	// No signals before warmup or in observe-only mode
-	if !warmedUp || e.config.ObserveOnly {
+	// No signals before warmup.
+	if !warmedUp {
 		return
 	}
 
 	// Evaluate signals (outside lock, using snapshotted values)
 	fees := e.RoundTripFeeBps()
+	snapshot := sanitizeSnapshot(e.config, makerRaw, takerRaw, meanAB, meanBA, stddevAB, stddevBA, now)
+	requiredOpenBps := fees + e.config.MinProfitBps + e.config.ImpactBufferBps + e.config.LatencyBufferBps
 
 	// Check AB direction: Long maker, Short taker
-	if zAB > e.config.ZOpen {
-		expectedProfit := spreadAB - meanAB
-		if expectedProfit > fees+e.config.MinProfitBps {
+	if snapshot.ValidAB {
+		qty := snapshot.executableQuantity(e.config, LongMakerShortTaker)
+		dynamicThreshold := meanAB + e.config.ZOpen*stddevAB
+		if qty.GreaterThan(decimal.Zero) && spreadAB >= dynamicThreshold && spreadAB > requiredOpenBps {
 			e.emitSignal(&Signal{
-				Direction:      LongMakerShortTaker,
-				SpreadBps:      spreadAB,
-				ZScore:         zAB,
-				Mean:           meanAB,
-				StdDev:         stddevAB,
-				ExpectedProfit: expectedProfit - fees,
-				MakerBid:       makerBid,
-				MakerAsk:       makerAsk,
-				TakerBid:       takerBid,
-				TakerAsk:       takerAsk,
-				Timestamp:      now,
+				Direction:           LongMakerShortTaker,
+				SpreadBps:           spreadAB,
+				ZScore:              zAB,
+				Mean:                meanAB,
+				StdDev:              stddevAB,
+				ExpectedProfit:      spreadAB - fees,
+				NetEdgeBps:          spreadAB - requiredOpenBps,
+				DynamicThresholdBps: dynamicThreshold,
+				Quantity:            qty,
+				MakerBid:            snapshot.MakerBid,
+				MakerAsk:            snapshot.MakerAsk,
+				TakerBid:            snapshot.TakerBid,
+				TakerAsk:            snapshot.TakerAsk,
+				MakerBidQty:         snapshot.MakerBidQty,
+				MakerAskQty:         snapshot.MakerAskQty,
+				TakerBidQty:         snapshot.TakerBidQty,
+				TakerAskQty:         snapshot.TakerAskQty,
+				Timestamp:           now,
 			})
 		}
 	}
 
 	// Check BA direction: Long taker, Short maker
-	if zBA > e.config.ZOpen {
-		expectedProfit := spreadBA - meanBA
-		if expectedProfit > fees+e.config.MinProfitBps {
+	if snapshot.ValidBA {
+		qty := snapshot.executableQuantity(e.config, LongTakerShortMaker)
+		dynamicThreshold := meanBA + e.config.ZOpen*stddevBA
+		if qty.GreaterThan(decimal.Zero) && spreadBA >= dynamicThreshold && spreadBA > requiredOpenBps {
 			e.emitSignal(&Signal{
-				Direction:      LongTakerShortMaker,
-				SpreadBps:      spreadBA,
-				ZScore:         zBA,
-				Mean:           meanBA,
-				StdDev:         stddevBA,
-				ExpectedProfit: expectedProfit - fees,
-				MakerBid:       makerBid,
-				MakerAsk:       makerAsk,
-				TakerBid:       takerBid,
-				TakerAsk:       takerAsk,
-				Timestamp:      now,
+				Direction:           LongTakerShortMaker,
+				SpreadBps:           spreadBA,
+				ZScore:              zBA,
+				Mean:                meanBA,
+				StdDev:              stddevBA,
+				ExpectedProfit:      spreadBA - fees,
+				NetEdgeBps:          spreadBA - requiredOpenBps,
+				DynamicThresholdBps: dynamicThreshold,
+				Quantity:            qty,
+				MakerBid:            snapshot.MakerBid,
+				MakerAsk:            snapshot.MakerAsk,
+				TakerBid:            snapshot.TakerBid,
+				TakerAsk:            snapshot.TakerAsk,
+				MakerBidQty:         snapshot.MakerBidQty,
+				MakerAskQty:         snapshot.MakerAskQty,
+				TakerBidQty:         snapshot.TakerBidQty,
+				TakerAskQty:         snapshot.TakerAskQty,
+				Timestamp:           now,
 			})
 		}
 	}
@@ -336,56 +286,51 @@ func (e *Engine) Snapshot() *Snapshot {
 	defer e.mu.Unlock()
 
 	meanAB := 0.0
+	stddevAB := 0.0
 	if e.statsAB != nil {
 		meanAB = e.statsAB.Mean()
+		stddevAB = e.statsAB.StdDev()
 	}
 	meanBA := 0.0
+	stddevBA := 0.0
 	if e.statsBA != nil {
 		meanBA = e.statsBA.Mean()
+		stddevBA = e.statsBA.StdDev()
+	}
+	now := time.Now()
+	maker := TopOfBook{
+		BidPrice:  e.makerBid,
+		BidQty:    e.makerBidQty,
+		AskPrice:  e.makerAsk,
+		AskQty:    e.makerAskQty,
+		Timestamp: e.makerTS,
+	}
+	taker := TopOfBook{
+		BidPrice:  e.takerBid,
+		BidQty:    e.takerBidQty,
+		AskPrice:  e.takerAsk,
+		AskQty:    e.takerAskQty,
+		Timestamp: e.takerTS,
 	}
 
-	return &Snapshot{
-		MakerBid: e.makerBid,
-		MakerAsk: e.makerAsk,
-		TakerBid: e.takerBid,
-		TakerAsk: e.takerAsk,
-		MeanAB:   meanAB,
-		MeanBA:   meanBA,
-	}
+	snapshot := sanitizeSnapshot(e.config, maker, taker, meanAB, meanBA, stddevAB, stddevBA, now)
+	return &snapshot
 }
 
 // CurrentZ returns the current Z-Scores for both directions.
 // Used by the trader to check close/stop-loss conditions.
 func (e *Engine) CurrentZ() (zAB, zBA float64) {
-	e.mu.Lock()
-	makerBid := e.makerBid
-	makerAsk := e.makerAsk
-	takerBid := e.takerBid
-	takerAsk := e.takerAsk
-
-	if makerBid.IsZero() || takerBid.IsZero() {
-		e.mu.Unlock()
+	snapshot := e.Snapshot()
+	if snapshot == nil {
 		return 0, 0
 	}
-
-	makerMid := makerBid.Add(makerAsk).Div(decimal.NewFromInt(2))
-	takerMid := takerBid.Add(takerAsk).Div(decimal.NewFromInt(2))
-	midPrice := makerMid.Add(takerMid).Div(decimal.NewFromInt(2))
-
-	if midPrice.IsZero() {
-		e.mu.Unlock()
-		return 0, 0
+	if snapshot.StdDevAB > 1e-9 {
+		zAB = (snapshot.SpreadAB - snapshot.MeanAB) / snapshot.StdDevAB
 	}
-
-	spreadABVal, _ := takerBid.Sub(makerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
-	spreadBAVal, _ := makerBid.Sub(takerAsk).Div(midPrice).Mul(decimal.NewFromInt(10000)).Float64()
-
-	// Access stats under lock to prevent concurrent read/write with onBBOUpdate.
-	zABResult := e.statsAB.ZScore(spreadABVal)
-	zBAResult := e.statsBA.ZScore(spreadBAVal)
-	e.mu.Unlock()
-
-	return zABResult, zBAResult
+	if snapshot.StdDevBA > 1e-9 {
+		zBA = (snapshot.SpreadBA - snapshot.MeanBA) / snapshot.StdDevBA
+	}
+	return zAB, zBA
 }
 
 // IsWarmedUp returns whether the engine has enough data to emit signals.
@@ -394,6 +339,23 @@ func (e *Engine) IsWarmedUp() bool {
 	defer e.mu.Unlock()
 	return e.tickCount >= e.config.WarmupTicks &&
 		time.Since(e.firstSeen) >= e.config.WarmupDuration
+}
+
+func orderBookTimestamp(ts int64) time.Time {
+	if ts <= 0 {
+		return time.Time{}
+	}
+	if ts > 1_000_000_000_000 {
+		return time.UnixMilli(ts)
+	}
+	return time.Unix(ts, 0)
+}
+
+func firstLevel(levels []marketdata.MarketLevel) (decimal.Decimal, decimal.Decimal) {
+	if len(levels) == 0 {
+		return decimal.Zero, decimal.Zero
+	}
+	return levels[0].Price, levels[0].Quantity
 }
 
 // logWarmupMilestone logs warmup progress at 25/50/75/100% milestones. Must be called under e.mu.
