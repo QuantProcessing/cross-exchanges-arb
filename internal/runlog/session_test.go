@@ -27,7 +27,7 @@ func TestNewSessionCreatesRunDirectoryAndFiles(t *testing.T) {
 		t.Fatalf("session.Dir = %q, want %q", session.Dir, wantDir)
 	}
 
-	for _, path := range []string{session.RunLogPath, session.RawPath} {
+	for _, path := range []string{session.RunLogPath, session.RawPath, session.EventsPath} {
 		info, statErr := os.Stat(path)
 		if statErr != nil {
 			t.Fatalf("Stat(%s) error = %v", path, statErr)

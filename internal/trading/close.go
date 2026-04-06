@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/runlog"
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/QuantProcessing/exchanges/account"
@@ -110,10 +111,8 @@ func (t *Trader) closePosition(reason string) {
 		return
 	}
 	t.state = StateClosing
+	roundID := t.roundID
 	t.mu.Unlock()
-
-	t.logger.Infof("%s 🔴 closing  %s  held=%s",
-		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second))
 
 	closeStart := time.Now()
 	closeCtx := t.ctx
@@ -292,7 +291,25 @@ func (t *Trader) closePosition(reason string) {
 		t.state = StateManualIntervention
 		t.mu.Unlock()
 
-		t.logger.Errorf("%s ❌ CLOSE FAILED residual=%s: %s", t.roundTag(), residualLeg, strings.Join(failures, "; "))
+		t.evtErrorf("close_failed residual=%s detail=%q", residualLeg, strings.Join(failures, "; "))
+		t.evtErrorf("manual_intervention reason=%q", fmt.Sprintf("close failed residual=%s", residualLeg))
+		t.recordRoundEvent(runlog.Event{
+			At:       time.Now(),
+			Type:     "close_failed",
+			Round:    roundID,
+			State:    string(StateManualIntervention),
+			Reason:   residualLeg,
+			Quantity: pos.OpenQuantity.String(),
+			Detail:   strings.Join(failures, "; "),
+		})
+		t.recordRoundEvent(runlog.Event{
+			At:       time.Now(),
+			Type:     "manual_intervention",
+			Round:    roundID,
+			State:    string(StateManualIntervention),
+			Reason:   fmt.Sprintf("close failed residual=%s", residualLeg),
+			Quantity: pos.OpenQuantity.String(),
+		})
 		go telegram.Notify(fmt.Sprintf(
 			"🚨 %s CLOSE FAILED\nResidual: %s\nQty: %s\n%s",
 			t.roundTag(), residualLeg, pos.OpenQuantity, strings.Join(failures, "; "),
@@ -307,9 +324,20 @@ func (t *Trader) closePosition(reason string) {
 
 	t.finishSuccessfulClose()
 
-	t.logger.Infof("%s ✅ closed  %s  round=%d/%d (%dms)",
-		t.roundTag(), reason, t.completedRounds, t.config.MaxRounds,
+	t.evtInfof("close_done reason=%q held=%s round=%d/%d wait=%dms",
+		reason, time.Since(pos.OpenTime).Round(time.Second), t.completedRounds, t.config.MaxRounds,
 		time.Since(closeStart).Milliseconds())
+	t.recordRoundEvent(runlog.Event{
+		At:       time.Now(),
+		Type:     "close_done",
+		Round:    roundID,
+		State:    string(StateCooldown),
+		Reason:   reason,
+		Quantity: pos.OpenQuantity.String(),
+		HeldMS:   time.Since(pos.OpenTime).Milliseconds(),
+		WaitMS:   time.Since(closeStart).Milliseconds(),
+		Rounds:   t.completedRounds,
+	})
 	go telegram.Notify(fmt.Sprintf("🔴 %s Closed\n%s\nHeld: %s",
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second)))
 }
@@ -567,7 +595,7 @@ func (t *Trader) logRealizedCloseMetrics(pos *ArbPosition, longCloseOrder, short
 		return
 	}
 
-	t.logger.Infof("%s 💹 realized  signal=%.1fbps entry=%.1fbps exit=%.1fbps gross=%.1fbps fee=%.1fbps net=%.1fbps",
+	t.logger.Infof("%s 💹 realized  signal=%+.1fbps entry=%+.1fbps exit=%+.1fbps gross=%+.1fbps fee=%+.1fbps net=%+.1fbps",
 		t.roundTag(), pos.OpenExpectedProfit, metrics.EntryBps, metrics.ExitBps, metrics.GrossBps, metrics.FeeBps, metrics.NetBps)
 }
 

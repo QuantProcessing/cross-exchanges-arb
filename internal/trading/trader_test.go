@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/runlog"
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/QuantProcessing/exchanges/account"
@@ -23,12 +26,14 @@ type testExchange struct {
 	mu                sync.Mutex
 	name              string
 	symbolDetails     *exchanges.SymbolDetails
+	balance           decimal.Decimal
 	placedQtys        []decimal.Decimal
 	placedOrders      []*exchanges.OrderParams
 	cancelCalls       int
 	cancelAllCalls    int
 	lastCancelOrder   string
 	forcePlaceErr     error
+	fetchBalanceErr   error
 	watchOrdersErr    error
 	watchPositionsErr error
 	watchFillsErr     error
@@ -282,7 +287,12 @@ func (e *testExchange) FetchAccount(ctx context.Context) (*exchanges.Account, er
 	return &exchanges.Account{}, nil
 }
 func (e *testExchange) FetchBalance(ctx context.Context) (decimal.Decimal, error) {
-	return decimal.Zero, nil
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fetchBalanceErr != nil {
+		return decimal.Zero, e.fetchBalanceErr
+	}
+	return e.balance, nil
 }
 func (e *testExchange) FetchSymbolDetails(ctx context.Context, symbol string) (*exchanges.SymbolDetails, error) {
 	return e.symbolDetails, nil
@@ -692,10 +702,13 @@ func TestTrader_CancelPendingMakerWaitsForResolvableOrderID(t *testing.T) {
 }
 
 func TestTrader_HedgeFailureMovesToManualIntervention(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
 	tr := newTestTrader()
+	tr.logger = zap.New(core).Sugar()
 	tr.taker.(*testExchange).forcePlaceErr = errors.New("boom")
+	wantQty := decimal.RequireFromString("0.001")
 
-	_ = tr.handleMakerFillForTest(decimal.RequireFromString("0.001"))
+	_ = tr.handleMakerFillForTest(wantQty)
 
 	if tr.state != StateManualIntervention {
 		t.Fatalf("state = %s, want manual_intervention", tr.state)
@@ -706,10 +719,27 @@ func TestTrader_HedgeFailureMovesToManualIntervention(t *testing.T) {
 	if CanAcceptSignal(tr.state) {
 		t.Fatal("manual intervention must reject new signals")
 	}
+	hedgeFailedLogs := observed.FilterMessageSnippet("EVT hedge_failed").All()
+	if len(hedgeFailedLogs) != 1 {
+		t.Fatalf("hedge_failed event logs = %d, want 1", len(hedgeFailedLogs))
+	}
+	if !strings.Contains(hedgeFailedLogs[0].Message, "qty="+wantQty.String()) {
+		t.Fatalf("hedge_failed log missing qty: %s", hedgeFailedLogs[0].Message)
+	}
+
+	manualLogs := observed.FilterMessageSnippet("EVT manual_intervention").All()
+	if len(manualLogs) != 1 {
+		t.Fatalf("manual_intervention event logs = %d, want 1", len(manualLogs))
+	}
+	if !strings.Contains(manualLogs[0].Message, `reason="hedge failed for qty=`) {
+		t.Fatalf("manual_intervention log missing hedge reason: %s", manualLogs[0].Message)
+	}
 }
 
 func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
 	tr := newTestTraderWithPosition()
+	tr.logger = zap.New(core).Sugar()
 	tr.taker.(*testExchange).forcePlaceErr = errors.New("close failed")
 
 	tr.closePosition("test")
@@ -738,6 +768,21 @@ func TestTrader_CloseFailureBlocksNextRound(t *testing.T) {
 	})
 	if tr.state != StateManualIntervention {
 		t.Fatalf("new signals must remain blocked after close failure, state = %s", tr.state)
+	}
+	closeFailedLogs := observed.FilterMessageSnippet("EVT close_failed").All()
+	if len(closeFailedLogs) != 1 {
+		t.Fatalf("close_failed event logs = %d, want 1", len(closeFailedLogs))
+	}
+	if !strings.Contains(closeFailedLogs[0].Message, "residual=short") || !strings.Contains(closeFailedLogs[0].Message, "detail=") {
+		t.Fatalf("close_failed log missing residual/detail context: %s", closeFailedLogs[0].Message)
+	}
+
+	manualLogs := observed.FilterMessageSnippet("EVT manual_intervention").All()
+	if len(manualLogs) != 1 {
+		t.Fatalf("manual_intervention event logs = %d, want 1", len(manualLogs))
+	}
+	if !strings.Contains(manualLogs[0].Message, `reason="close failed residual=short"`) {
+		t.Fatalf("manual_intervention log missing close reason: %s", manualLogs[0].Message)
 	}
 }
 
@@ -937,6 +982,41 @@ func TestTrader_OpenUsesSignalQuantityWhenProvided(t *testing.T) {
 	}
 }
 
+func TestTrader_HandleSignalLogsEVTSignalAndMakerPlaced(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	logger := zap.New(core).Sugar()
+
+	tr, maker, _ := newActiveFlowTrader()
+	tr.logger = logger
+	maker.autoEmitWS = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	tr.HandleSignal(&spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99"),
+		TakerBid:       decimal.RequireFromString("101"),
+		TakerAsk:       decimal.RequireFromString("102"),
+	})
+
+	waitForTraderState(t, tr, StateWaitingFill)
+
+	if observed.FilterMessageSnippet("EVT signal").Len() != 1 {
+		t.Fatalf("signal event logs = %d, want 1", observed.FilterMessageSnippet("EVT signal").Len())
+	}
+	if observed.FilterMessageSnippet("EVT maker_placed").Len() != 1 {
+		t.Fatalf("maker_placed event logs = %d, want 1", observed.FilterMessageSnippet("EVT maker_placed").Len())
+	}
+}
+
 func TestTrader_OpenHedgesFromMakerFlowFillWithoutOrderUpdate(t *testing.T) {
 	core, observed := observer.New(zap.InfoLevel)
 	logger := zap.New(core).Sugar()
@@ -1002,9 +1082,8 @@ func TestTrader_OpenHedgesFromMakerFlowFillWithoutOrderUpdate(t *testing.T) {
 		t.Fatalf("hedge qty = %s, want %s", gotOrders[0].Quantity, makerQty)
 	}
 
-	fillLogs := observed.FilterMessageSnippet("💱 open_maker maker fill").All()
-	if len(fillLogs) != 1 {
-		t.Fatalf("maker fill logs = %d, want 1", len(fillLogs))
+	if observed.FilterMessageSnippet("EVT hedge_done").Len() != 1 {
+		t.Fatalf("hedge_done event logs = %d, want 1", observed.FilterMessageSnippet("EVT hedge_done").Len())
 	}
 }
 
@@ -1056,6 +1135,29 @@ func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	}
 	if !takerOrders[0].ReduceOnly {
 		t.Fatal("taker shutdown close must be reduce-only")
+	}
+}
+
+func TestTraderLifecycleLogsRemainVisible(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+
+	tr := newTestTraderWithPosition()
+	maker := tr.maker.(*testExchange)
+	taker := tr.taker.(*testExchange)
+	maker.autoEmitWS = true
+	taker.autoEmitWS = true
+	tr.logger = zap.New(core).Sugar()
+
+	tr.GracefulShutdown(2 * time.Second)
+
+	if observed.FilterMessageSnippet("🛑 graceful shutdown:").Len() != 1 {
+		t.Fatalf("graceful shutdown logs = %d, want 1", observed.FilterMessageSnippet("🛑 graceful shutdown:").Len())
+	}
+	if observed.FilterMessageSnippet("EVT close_done").Len() != 1 {
+		t.Fatalf("close_done event logs = %d, want 1", observed.FilterMessageSnippet("EVT close_done").Len())
+	}
+	if observed.FilterMessageSnippet("🛑 graceful shutdown complete").Len() != 1 {
+		t.Fatalf("graceful shutdown complete logs = %d, want 1", observed.FilterMessageSnippet("🛑 graceful shutdown complete").Len())
 	}
 }
 
@@ -1509,5 +1611,44 @@ func TestTrader_VerifyCloseLegFailsWhenFetchCannotConfirm(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("verifyCloseLeg = true, want false")
+	}
+}
+
+func TestTraderHandleSignalRecordsRoundEvents(t *testing.T) {
+	tr := newTestTrader()
+	tr.makerAccount = nil
+
+	eventsFile, err := os.Create(filepath.Join(t.TempDir(), "events.jsonl"))
+	if err != nil {
+		t.Fatalf("Create(events.jsonl): %v", err)
+	}
+	sink := runlog.NewEventSink(eventsFile)
+	t.Cleanup(func() { _ = sink.Close() })
+	tr.SetEventSink(sink)
+
+	tr.HandleSignal(&spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		Quantity:       decimal.RequireFromString("0.002"),
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99.9"),
+	})
+
+	waitForCondition(t, 500*time.Millisecond, func() bool {
+		data, readErr := os.ReadFile(eventsFile.Name())
+		return readErr == nil && strings.Count(string(data), `"category":"round"`) >= 2
+	}, "round events to be recorded")
+
+	data, err := os.ReadFile(eventsFile.Name())
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", eventsFile.Name(), err)
+	}
+	if !strings.Contains(string(data), `"type":"signal"`) {
+		t.Fatalf("missing signal event: %s", data)
+	}
+	if !strings.Contains(string(data), `"type":"manual_intervention"`) {
+		t.Fatalf("missing manual_intervention event: %s", data)
 	}
 }

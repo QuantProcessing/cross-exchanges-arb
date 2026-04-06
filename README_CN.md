@@ -31,10 +31,10 @@
 
 1. **价差引擎** 通过 WebSocket 订阅两个交易所的订单簿
 2. 在滚动窗口内计算均值 (μ) 和标准差 (σ)
-3. 当 Z-Score 超过 `--z-open` 阈值，且预期利润 > 手续费 + `--min-profit` 时，发出交易信号
+3. 先清洗异常盘口，再检查目标数量对应的可执行价差，只有同时超过硬性净边际门槛和动态 `mean + z-open * rolling std` 阈值时才开仓
 4. **交易器** 在 Maker 交易所下 **Post-Only 限价单**
 5. 成交后，立即在 Taker 交易所 **市价对冲**
-6. 持续监控仓位：**止盈**（Z < `--z-close`）、**止损**（Z < `--z-stop`）、**超时**（`--max-hold`）
+6. 持续监控仓位：当清洗后的可执行价差回落到动态 `mean + z-close * rolling std` 阈值以下时平仓，同时保留 **止损**（`--z-stop`）和 **超时**（`--max-hold`）
 
 ## 交易所支持
 
@@ -67,36 +67,81 @@ cp .env.example .env
 # 编辑 .env 填入你的 API Key
 ```
 
-### 运行模式
+### 运行方式
 
-**阶段 0 — 观察模式**（仅采集价差数据）：
-```bash
-go run . --maker DECIBEL --taker LIGHTER --symbol BTC --observe-only
-```
-输出 CSV 文件供离线分析。
+现在运行路径固定直接走 `live`，CLI 不再提供 dry-run / observe-only 之类的模式选择。
 
-**阶段 1 — 模拟运行**（模拟信号，不下真单）：
-```bash
-go run . --maker DECIBEL --taker LIGHTER --symbol BTC --qty 0.003 \
-  --z-open 2.0 --z-close 0.5 --z-stop -1.5 \
-  --window 300 --max-hold 5m --dry-run
-```
+每次运行都会在 `logs/<timestamp>_<maker>_<taker>_<symbol>/` 下生成独立产物目录：
 
-**阶段 2 — 实盘验证**：
+- `run.log`：面向值班视角的运行日志，包含低频 `STAT` 心跳和交易 / PnL 生命周期 `EVT` 事件
+- `events.jsonl`：低频结构化事件流，只记录 `session`、`round`、`pnl`、`health` 四类事件
+- `raw.jsonl`：原始单边订单簿流，maker 和 taker 共用一个文件，但每一行只记录一个 side
+
+### `raw.jsonl` 字段说明
+
+`raw.jsonl` 每一行都是一个 JSON 对象，对应某一个交易所 side 的一次订单簿快照。它不是 unified 结构：maker 更新和 taker 更新会作为两条独立记录写在同一个文件里。
+
+顶层字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `ts_local` | 本地写入这条 raw 记录时的墙钟时间。 |
+| `side` | 这条记录属于哪条腿：`maker` 或 `taker`。 |
+| `exchange` | 当前记录所属交易所名称。 |
+| `symbol` | 当前跟踪的基础币种，例如 `BTC`。 |
+| `exchange_ts` | 本地订单簿快照里携带的时间戳。如果适配器拿不到原生服务端时间，可能会退化为本地接收时间。EdgeX 当前就属于这种 best-effort 情况。 |
+| `quote_lag_ms` | best-effort 的行情延迟，单位毫秒；当 `exchange_ts` 存在时，计算方式为 `ts_local - exchange_ts`。 |
+| `bids` | 这条 raw 快照中的买盘档位。 |
+| `asks` | 这条 raw 快照中的卖盘档位。 |
+
+嵌套盘口字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `bids[].price` | 某一档买盘价格。 |
+| `bids[].qty` | 该买盘档位的数量。 |
+| `asks[].price` | 某一档卖盘价格。 |
+| `asks[].qty` | 该卖盘档位的数量。 |
+
+Raw 流说明：
+
+- `raw.jsonl` 故意不包含 `schema_version`。
+- 当前运行时会记录每侧各 2 档盘口。
+- 因为 maker 和 taker 是分开输出的，如果离线工具想得到 unified 视图，需要自行合并。
+
+### `run.log`
+
+`run.log` 现在优先服务值班的人：
+
+- `STAT ...` 行用于快速回答当前是否安全、是否赚钱、卡在哪一步
+- `EVT ...` 行用于记录关键生命周期事件，例如 signal、maker 下单、hedge 成功 / 失败、close 成功 / 失败、manual intervention、PnL 更新
+- 不再在每次订单簿更新时输出一条详细 `MKT ...` 市场日志
+
+### `events.jsonl`
+
+`events.jsonl` 是复盘导向的结构化事件流，保持刻意简化，只记录：
+
+- `session`：运行开始 / 停止
+- `health`：与 `STAT` 心跳同频率的低频健康快照
+- `round`：关键交易生命周期事件
+- `pnl`：周期余额刷新和轮次已实现收益摘要
+
+**运行**：
 ```bash
 go run . --maker DECIBEL --taker LIGHTER --symbol BTC --qty 0.003 \
   --z-open 2.0 --z-close 0.5 --z-stop -1.5 \
   --window 300 --max-hold 5m \
-  --maker-timeout 15s --max-rounds 1 --live-validate=true
+  --maker-timeout 15s --max-rounds 1
 ```
 
-实盘验证模式默认带有限制：
+当前运行时默认带有限制：
 
 - 同一时间只允许一个完整轮次
 - maker 单超时后会进入确认终态的撤单流程
 - maker 部分成交会立即在 taker 腿对冲
 - 成功平仓后先进入 cooldown，再允许下一轮
 - hedge / close 未决失败会进入 `manual_intervention`
+- 每次开仓都会输出结构化 recap，记录 signal / maker / fill / hedge 各阶段的 maker+taker BBO 与耗时
 
 ## 配置说明
 
@@ -133,29 +178,32 @@ TELEGRAM_CHAT_ID=...
 | `--taker-quote-currency` | `` | 可选的 taker 报价币种覆盖 |
 | `--symbol` | `BTC` | 交易币种（基础货币） |
 | `--qty` | `0.001` | 下单数量（基础货币单位） |
-| `--z-open` | `2.0` | 开仓 Z-Score 阈值 |
-| `--z-close` | `0.5` | 平仓 Z-Score 阈值（止盈） |
+| `--z-open` | `2.0` | 基于清洗后可执行价差的动态开仓阈值系数 |
+| `--z-close` | `0.5` | 基于清洗后可执行价差的动态平仓阈值系数 |
 | `--z-stop` | `-1.0` | 止损 Z-Score 阈值 |
 | `--window` | `500` | 滚动窗口大小（tick 数） |
 | `--min-profit` | `1.0` | 最低净利润（BPS，扣除手续费后） |
+| `--impact-buffer-bps` | `0` | 预留给冲击成本的额外 BPS buffer |
+| `--latency-buffer-bps` | `0` | 预留给延迟 / 报价漂移的额外 BPS buffer |
 | `--warmup-ticks` | `200` | 预热期最少 tick 数 |
 | `--warmup-duration` | `3m` | 开始交易前的最短时间预热 |
 | `--cooldown` | `5s` | 交易冷却时间 |
 | `--max-hold` | `30m` | 最大持仓时间 |
 | `--slippage` | `0.002` | 滑点容忍度 (0.2%) |
 | `--maker-timeout` | `15s` | Maker 订单超时后的撤单/重置阈值 |
-| `--max-rounds` | `1` | 实盘验证模式下允许的最大完成轮数 |
-| `--live-validate` | `true` | 开启实盘验证保护逻辑 |
-| `--dry-run` | `false` | 模拟模式 |
-| `--observe-only` | `false` | 观察模式（仅输出 CSV） |
+| `--max-quote-age` | `1.5s` | 超过该时长的盘口会被视为 stale 而忽略 |
+| `--max-rounds` | `1` | 达到该完成轮数后不再开启新一轮 |
 
 ## 部署
 
 ### 编译
 
 ```bash
-# 交叉编译 Linux 版本
-GOOS=linux GOARCH=amd64 go build -o cross-arb .
+# 打包 Linux amd64 可执行文件到 dist/
+bash scripts/build-linux-amd64.sh
+
+# 输出
+# dist/cross-arb-linux-amd64
 ```
 
 ### PM2 管理

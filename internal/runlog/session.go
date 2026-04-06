@@ -18,8 +18,10 @@ type Session struct {
 	Dir        string
 	RunLogPath string
 	RawPath    string
+	EventsPath string
 	RunLogFile *os.File
 	RawFile    *os.File
+	Events     *EventSink
 }
 
 func NewSession(root string, opts SessionOptions) (*Session, error) {
@@ -45,6 +47,7 @@ func NewSession(root string, opts SessionOptions) (*Session, error) {
 		Dir:        dir,
 		RunLogPath: filepath.Join(dir, "run.log"),
 		RawPath:    filepath.Join(dir, "raw.jsonl"),
+		EventsPath: filepath.Join(dir, "events.jsonl"),
 	}
 
 	var err error
@@ -57,6 +60,13 @@ func NewSession(root string, opts SessionOptions) (*Session, error) {
 		_ = session.RunLogFile.Close()
 		return nil, fmt.Errorf("create raw.jsonl: %w", err)
 	}
+	eventsFile, err := os.Create(session.EventsPath)
+	if err != nil {
+		_ = session.RawFile.Close()
+		_ = session.RunLogFile.Close()
+		return nil, fmt.Errorf("create events.jsonl: %w", err)
+	}
+	session.Events = NewEventSink(eventsFile)
 
 	return session, nil
 }
@@ -67,6 +77,11 @@ func (s *Session) Close() error {
 	}
 
 	var firstErr error
+	if s.Events != nil {
+		if err := s.Events.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if s.RunLogFile != nil {
 		if err := s.RunLogFile.Close(); err != nil && firstErr == nil {
 			firstErr = err

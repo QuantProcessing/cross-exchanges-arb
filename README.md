@@ -31,10 +31,10 @@ Exchange A (Maker)         Exchange B (Taker)
 
 1. **Spread Engine** subscribes to both exchange order books via WebSocket
 2. Computes rolling mean (μ) and standard deviation (σ) over a configurable window
-3. When Z-Score exceeds `--z-open`, signals a trade if net profit > fees + `--min-profit`
+3. Sanitizes top-of-book quotes, checks executable spread for the target quantity, then opens only when spread clears both hard net-edge buffers and the dynamic `mean + z-open * rolling std` threshold
 4. **Trader** places a **post-only maker order** on the maker exchange
 5. On fill, immediately **hedges with a market order** on the taker exchange
-6. Monitors position for **close** (Z < `--z-close`), **stop-loss** (Z < `--z-stop`), or **timeout** (`--max-hold`)
+6. Monitors position for **close** when sanitized executable spread reverts below the dynamic `mean + z-close * rolling std` threshold, on **stop-loss** (`--z-stop`), or on **timeout** (`--max-hold`)
 
 ## Exchange Support
 
@@ -67,36 +67,81 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
-### Run Modes
+### Run
 
-**Phase 0 — Observe** (collect spread data only, no trading):
-```bash
-go run . --maker DECIBEL --taker LIGHTER --symbol BTC --observe-only
-```
-Outputs a CSV file for offline analysis.
+The runtime now executes directly in `live`; there is no dry-run or observe-only mode selector in the CLI.
 
-**Phase 1 — Dry Run** (simulate signals, no real orders):
-```bash
-go run . --maker DECIBEL --taker LIGHTER --symbol BTC --qty 0.003 \
-  --z-open 2.0 --z-close 0.5 --z-stop -1.5 \
-  --window 300 --max-hold 5m --dry-run
-```
+Each run creates an isolated artifact directory under `logs/<timestamp>_<maker>_<taker>_<symbol>/`:
 
-**Phase 2 — Live Validation**:
+- `run.log`: operator-facing runtime log with low-frequency `STAT` heartbeats plus `EVT` lifecycle lines for trading and PnL events
+- `events.jsonl`: low-volume structured event stream for `session`, `round`, `pnl`, and `health` events
+- `raw.jsonl`: raw single-side orderbook stream for maker and taker, written as separate records in one file
+
+### `raw.jsonl` Schema
+
+`raw.jsonl` writes one JSON object per exchange-side orderbook snapshot. It is not a unified maker+taker record: maker updates and taker updates are emitted as separate lines in the same file.
+
+Top-level fields:
+
+| Field | Meaning |
+| --- | --- |
+| `ts_local` | Local wall-clock time when this raw record was written. |
+| `side` | Which leg this record belongs to: `maker` or `taker`. |
+| `exchange` | Exchange name for this record. |
+| `symbol` | Base symbol being tracked, for example `BTC`. |
+| `exchange_ts` | Timestamp carried by the local orderbook snapshot. When the adapter has no native server timestamp, it may fall back to a locally stamped receive time. EdgeX currently falls into this best-effort category. |
+| `quote_lag_ms` | Best-effort quote lag in milliseconds, computed as `ts_local - exchange_ts` when `exchange_ts` exists. |
+| `bids` | Bid levels included in this raw snapshot. |
+| `asks` | Ask levels included in this raw snapshot. |
+
+Nested book fields:
+
+| Field | Meaning |
+| --- | --- |
+| `bids[].price` | Price for one bid level. |
+| `bids[].qty` | Quantity available at that bid level. |
+| `asks[].price` | Price for one ask level. |
+| `asks[].qty` | Quantity available at that ask level. |
+
+Raw stream notes:
+
+- `raw.jsonl` intentionally omits `schema_version`.
+- The runtime currently records top-2 levels from each side.
+- Because maker and taker are emitted separately, downstream tooling must merge them if it wants a unified cross-exchange view.
+
+### `run.log`
+
+`run.log` is optimized for the operator on call:
+
+- `STAT ...` lines answer whether the bot is safe, profitable, and blocked
+- `EVT ...` lines capture important lifecycle transitions such as signal, maker placement, hedge completion/failure, close completion/failure, manual intervention, and PnL updates
+- the runtime no longer writes one market-detail line per orderbook update
+
+### `events.jsonl`
+
+`events.jsonl` is the replay-oriented structured stream. It stays intentionally small and only records:
+
+- `session` events such as run start / stop
+- `health` events emitted at the same low frequency as `STAT` heartbeats
+- `round` events for important trading lifecycle transitions
+- `pnl` events for periodic balance refreshes and realized round summaries
+
+**Run**:
 ```bash
 go run . --maker DECIBEL --taker LIGHTER --symbol BTC --qty 0.003 \
   --z-open 2.0 --z-close 0.5 --z-stop -1.5 \
   --window 300 --max-hold 5m \
-  --maker-timeout 15s --max-rounds 1 --live-validate=true
+  --maker-timeout 15s --max-rounds 1
 ```
 
-Live validation mode is intentionally constrained:
+The runtime is intentionally constrained:
 
 - one active round at a time
 - maker order timeout and settlement-aware cancel flow
 - partial maker fills hedge immediately on the taker leg
 - successful close enters cooldown before the next round
 - unresolved hedge/close failures move the trader into `manual_intervention`
+- every opened round logs a structured recap with signal / maker / fill / hedge BBO snapshots and stage timings
 
 ## Configuration
 
@@ -129,29 +174,32 @@ TELEGRAM_CHAT_ID=...
 | `--taker-quote-currency` | `` | Optional taker quote currency override |
 | `--symbol` | `BTC` | Trading symbol (base currency) |
 | `--qty` | `0.001` | Order quantity in base currency |
-| `--z-open` | `2.0` | Z-Score threshold to open position |
-| `--z-close` | `0.5` | Z-Score threshold to close (take profit) |
+| `--z-open` | `2.0` | Dynamic open threshold multiplier on sanitized executable spread |
+| `--z-close` | `0.5` | Dynamic close threshold multiplier on sanitized executable spread |
 | `--z-stop` | `-1.0` | Z-Score for stop-loss |
 | `--window` | `500` | Rolling window size in ticks |
 | `--min-profit` | `1.0` | Minimum net profit in BPS after fees |
+| `--impact-buffer-bps` | `0` | Extra BPS buffer reserved for market impact |
+| `--latency-buffer-bps` | `0` | Extra BPS buffer reserved for latency / quote drift |
 | `--warmup-ticks` | `200` | Minimum ticks before trading |
 | `--warmup-duration` | `3m` | Minimum wall-clock warmup before trading |
 | `--cooldown` | `5s` | Cooldown between trades |
 | `--max-hold` | `30m` | Max position hold time |
 | `--slippage` | `0.002` | Slippage tolerance (0.2%) |
 | `--maker-timeout` | `15s` | Maker order timeout before cancel/reset |
-| `--max-rounds` | `1` | Max completed rounds in live validation mode |
-| `--live-validate` | `true` | Enable live-validation safeguards |
-| `--dry-run` | `false` | Simulate only |
-| `--observe-only` | `false` | Collect data only, output CSV |
+| `--max-quote-age` | `1.5s` | Max accepted quote age before the signal is treated as stale |
+| `--max-rounds` | `1` | Max completed rounds before the runtime stops opening new rounds |
 
 ## Deployment
 
 ### Build
 
 ```bash
-# Cross-compile for Linux server
-GOOS=linux GOARCH=amd64 go build -o cross-arb .
+# Build Linux amd64 binary into dist/
+bash scripts/build-linux-amd64.sh
+
+# Output
+# dist/cross-arb-linux-amd64
 ```
 
 ### PM2

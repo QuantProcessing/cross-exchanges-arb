@@ -7,6 +7,7 @@ import (
 	"time"
 
 	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/runlog"
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/QuantProcessing/exchanges/account"
@@ -59,6 +60,7 @@ type Trader struct {
 	openFlow        *openFlowState
 	ctx             context.Context
 	pnl             *PnLTracker
+	events          *runlog.EventSink
 	makerOrderCh    chan *exchanges.Order
 	takerOrderCh    chan *exchanges.Order
 	marketUpdateCh  chan struct{}
@@ -75,6 +77,22 @@ var closeLegVerifyTimeout = 5 * time.Second
 
 func (t *Trader) roundTag() string {
 	return fmt.Sprintf("R%03d", t.roundID)
+}
+
+func (t *Trader) evtInfof(format string, args ...any) {
+	if t == nil || t.logger == nil {
+		return
+	}
+	args = append([]any{t.roundTag()}, args...)
+	t.logger.Infof("%s EVT "+format, args...)
+}
+
+func (t *Trader) evtErrorf(format string, args ...any) {
+	if t == nil || t.logger == nil {
+		return
+	}
+	args = append([]any{t.roundTag()}, args...)
+	t.logger.Errorf("%s EVT "+format, args...)
 }
 
 func NewTrader(maker, taker exchanges.Exchange, makerAccount, takerAccount *account.TradingAccount, engine MarketDataEngine, cfg *appconfig.Config, logger *zap.SugaredLogger) *Trader {
@@ -100,6 +118,34 @@ func NewTrader(maker, taker exchanges.Exchange, makerAccount, takerAccount *acco
 
 func (t *Trader) SetPnLTracker(p *PnLTracker) {
 	t.pnl = p
+}
+
+func (t *Trader) SetEventSink(events *runlog.EventSink) {
+	if t == nil {
+		return
+	}
+	t.events = events
+}
+
+func (t *Trader) recordRoundEvent(event runlog.Event) {
+	if t == nil || t.events == nil {
+		return
+	}
+	event.Category = "round"
+	if t.config != nil {
+		if event.MakerExchange == "" {
+			event.MakerExchange = t.config.MakerExchange
+		}
+		if event.TakerExchange == "" {
+			event.TakerExchange = t.config.TakerExchange
+		}
+		if event.Symbol == "" {
+			event.Symbol = t.config.Symbol
+		}
+	}
+	if err := t.events.Record(event); err != nil && t.logger != nil {
+		t.logger.Warnw("event sink write failed", "category", event.Category, "type", event.Type, "err", err)
+	}
 }
 
 func (t *Trader) Start(ctx context.Context) error {

@@ -9,8 +9,6 @@ import (
 	"time"
 
 	appconfig "github.com/QuantProcessing/cross-exchanges-arb/internal/config"
-	"github.com/QuantProcessing/cross-exchanges-arb/internal/marketdata"
-	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
@@ -268,11 +266,13 @@ func TestRun_StartsTradingAccounts(t *testing.T) {
 	}
 }
 
-func TestRun_WritesRunArtifactsWhenConfigured(t *testing.T) {
+func TestRun_LogOmitsPerFrameMarketDump(t *testing.T) {
 	oldNewExchangePair := newExchangePair
 	oldNowFunc := nowFunc
+	oldHeartbeatInterval := heartbeatInterval
 	t.Cleanup(func() { newExchangePair = oldNewExchangePair })
 	t.Cleanup(func() { nowFunc = oldNowFunc })
+	t.Cleanup(func() { heartbeatInterval = oldHeartbeatInterval })
 
 	book := &exchanges.OrderBook{
 		Symbol:    "BTC",
@@ -298,9 +298,11 @@ func TestRun_WritesRunArtifactsWhenConfigured(t *testing.T) {
 	logger := zap.New(core).Sugar()
 	cwd := withTempWorkingDir(t)
 	nowFunc = func() time.Time { return time.Date(2026, 4, 2, 1, 2, 3, 0, time.UTC) }
+	heartbeatInterval = 50 * time.Millisecond
 	runDir := cwd + "/logs/20260402_010203_EDGEX_LIGHTER_BTC"
 	rawPath := runDir + "/raw.jsonl"
 	runLogPath := runDir + "/run.log"
+	eventsPath := runDir + "/events.jsonl"
 	cfg := &appconfig.Config{
 		MakerExchange:  "EDGEX",
 		TakerExchange:  "LIGHTER",
@@ -312,12 +314,17 @@ func TestRun_WritesRunArtifactsWhenConfigured(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
 	go func() {
-		time.Sleep(300 * time.Millisecond)
-		cancel()
+		runDone <- Run(ctx, cfg, logger)
 	}()
 
-	if err := Run(ctx, cfg, logger); err != nil && err != context.Canceled {
+	logData := waitForRunLog(t, runLogPath, 2*time.Second, func(data string) bool {
+		return strings.Count(data, "STAT safe=") >= 2
+	})
+	cancel()
+
+	if err := <-runDone; err != nil && err != context.Canceled {
 		t.Fatalf("Run() error = %v", err)
 	}
 
@@ -328,46 +335,58 @@ func TestRun_WritesRunArtifactsWhenConfigured(t *testing.T) {
 	if len(data) == 0 {
 		t.Fatal("raw.jsonl should not be empty")
 	}
-	logData, err := os.ReadFile(runLogPath)
+	eventsData, err := os.ReadFile(eventsPath)
 	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", runLogPath, err)
+		t.Fatalf("ReadFile(%s): %v", eventsPath, err)
 	}
-	if !strings.Contains(string(logData), "MKT updated=") {
-		t.Fatalf("run.log should contain market detail lines, got: %s", string(logData))
+	if len(eventsData) == 0 {
+		t.Fatal("events.jsonl should not be empty")
+	}
+	if strings.Contains(logData, "MKT updated=") {
+		t.Fatalf("run.log should omit per-frame market detail lines, got: %s", logData)
+	}
+	statLines := strings.Count(logData, "STAT safe=")
+	if statLines < 2 {
+		t.Fatalf("run.log should contain multiple STAT heartbeat lines, got %d lines in: %s", statLines, logData)
+	}
+	if strings.Contains(logData, " ab=") || strings.Contains(logData, " ba=") {
+		t.Fatalf("STAT heartbeat should not include spread fields, got: %s", logData)
+	}
+	if strings.Contains(logData, " valid_ab=") || strings.Contains(logData, " valid_ba=") {
+		t.Fatalf("STAT heartbeat should not include validity flags, got: %s", logData)
+	}
+	if !strings.Contains(logData, "starting spread monitoring") {
+		t.Fatalf("run.log should retain lifecycle lines, got: %s", logData)
+	}
+	if !strings.Contains(string(eventsData), `"category":"session"`) {
+		t.Fatalf("events.jsonl should contain session events, got: %s", eventsData)
+	}
+	if !strings.Contains(string(eventsData), `"category":"health"`) {
+		t.Fatalf("events.jsonl should contain health events, got: %s", eventsData)
+	}
+	if strings.Contains(string(eventsData), `"category":"market"`) {
+		t.Fatalf("events.jsonl should not contain market events, got: %s", eventsData)
 	}
 }
 
-func TestMetricsStatsFromSnapshot_RoundsBpsFieldsToOneDecimal(t *testing.T) {
-	stats := metricsStatsFromSnapshot(&spread.Snapshot{
-		SpreadAB: 12.34,
-		SpreadBA: -1.26,
-		MeanAB:   2.25,
-		MeanBA:   -0.04,
-		StdDevAB: 0.15,
-		StdDevBA: 1.96,
-	}, marketdata.MarketFrame{})
+func waitForRunLog(t *testing.T, path string, timeout time.Duration, ready func(string) bool) string {
+	t.Helper()
 
-	if stats.SpreadABBps != 12.3 {
-		t.Fatalf("SpreadABBps = %v, want 12.3", stats.SpreadABBps)
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			last = string(data)
+			if ready(last) {
+				return last
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if stats.SpreadBABps != -1.3 {
-		t.Fatalf("SpreadBABps = %v, want -1.3", stats.SpreadBABps)
-	}
-	if stats.MeanAB != 2.3 {
-		t.Fatalf("MeanAB = %v, want 2.3", stats.MeanAB)
-	}
-	if stats.MeanBA != 0 {
-		t.Fatalf("MeanBA = %v, want 0.0", stats.MeanBA)
-	}
-	if stats.StdAB != 0.2 {
-		t.Fatalf("StdAB = %v, want 0.2", stats.StdAB)
-	}
-	if stats.StdBA != 2.0 {
-		t.Fatalf("StdBA = %v, want 2.0", stats.StdBA)
-	}
-	if stats.ZAB == 0 {
-		t.Fatal("ZAB should still be computed, got 0")
-	}
+
+	t.Fatalf("timed out waiting for run.log condition in %s; last contents: %s", path, last)
+	return ""
 }
 
 func withTempWorkingDir(t *testing.T) string {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/runlog"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/QuantProcessing/notify/telegram"
 	"github.com/shopspring/decimal"
@@ -16,6 +17,7 @@ type PnLTracker struct {
 	maker  exchanges.Exchange
 	taker  exchanges.Exchange
 	logger *zap.SugaredLogger
+	events *runlog.EventSink
 
 	makerName string
 	takerName string
@@ -48,6 +50,13 @@ func NewPnLTracker(ctx context.Context, maker, taker exchanges.Exchange, makerNa
 	p.startMakerBal = p.currentMakerBal
 	p.startTakerBal = p.currentTakerBal
 	return p
+}
+
+func (p *PnLTracker) SetEventSink(events *runlog.EventSink) {
+	if p == nil {
+		return
+	}
+	p.events = events
 }
 
 // refreshBalances fetches current balances from both exchanges.
@@ -97,8 +106,20 @@ func (p *PnLTracker) OnRoundComplete(ctx context.Context) {
 	takerPnL := p.currentTakerBal.Sub(p.startTakerBal)
 	totalPnL := makerPnL.Add(takerPnL)
 
-	p.logger.Infof("💰 R%03d pnl  %s=%s(%+s) %s=%s(%+s) total=%s",
+	p.logger.Infof("EVT pnl_realized round=%d %s=%s(%+s) %s=%s(%+s) total=%s",
 		p.rounds, p.makerName, p.currentMakerBal, makerPnL, p.takerName, p.currentTakerBal, takerPnL, totalPnL)
+	p.recordEvent(runlog.Event{
+		Category:      "pnl",
+		Type:          "realized",
+		Round:         p.rounds,
+		MakerExchange: p.makerName,
+		TakerExchange: p.takerName,
+		MakerBalance:  p.currentMakerBal.String(),
+		TakerBalance:  p.currentTakerBal.String(),
+		MakerPnL:      makerPnL.String(),
+		TakerPnL:      takerPnL.String(),
+		TotalPnL:      totalPnL.String(),
+	})
 
 	go telegram.Notify(fmt.Sprintf("💰 Round %d Complete\n%s: %s (PnL: %s)\n%s: %s (PnL: %s)\nTotal PnL: %s",
 		p.rounds,
@@ -118,8 +139,20 @@ func (p *PnLTracker) PeriodicRefresh(ctx context.Context) {
 	takerPnL := p.currentTakerBal.Sub(p.startTakerBal)
 	totalPnL := makerPnL.Add(takerPnL)
 
-	p.logger.Infof("📊 balance  %s=%s %s=%s pnl=%s rounds=%d",
+	p.logger.Infof("EVT pnl_refresh %s=%s %s=%s total=%s rounds=%d",
 		p.makerName, p.currentMakerBal, p.takerName, p.currentTakerBal, totalPnL, p.rounds)
+	p.recordEvent(runlog.Event{
+		Category:      "pnl",
+		Type:          "refresh",
+		MakerExchange: p.makerName,
+		TakerExchange: p.takerName,
+		MakerBalance:  p.currentMakerBal.String(),
+		TakerBalance:  p.currentTakerBal.String(),
+		MakerPnL:      makerPnL.String(),
+		TakerPnL:      takerPnL.String(),
+		TotalPnL:      totalPnL.String(),
+		Rounds:        p.rounds,
+	})
 }
 
 // StartupSummary returns a formatted summary for the startup Telegram notification.
@@ -136,4 +169,13 @@ func (p *PnLTracker) RoundCount() int {
 		return 0
 	}
 	return p.rounds
+}
+
+func (p *PnLTracker) recordEvent(event runlog.Event) {
+	if p == nil || p.events == nil {
+		return
+	}
+	if err := p.events.Record(event); err != nil && p.logger != nil {
+		p.logger.Warnw("event sink write failed", "category", event.Category, "type", event.Type, "err", err)
+	}
 }

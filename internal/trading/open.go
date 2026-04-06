@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantProcessing/cross-exchanges-arb/internal/runlog"
 	"github.com/QuantProcessing/cross-exchanges-arb/internal/spread"
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/QuantProcessing/exchanges/account"
@@ -55,20 +56,36 @@ func (t *Trader) HandleSignal(sig *spread.Signal) {
 	}
 	t.lastSignalTime = now
 	t.roundID++
+	roundID := t.roundID
 	roundTag := fmt.Sprintf("R%03d", t.roundID)
-
-	t.logger.Infof("%s 🟢 signal  %s  spread=%.1fbps Z=%.2f profit=%.1fbps",
-		roundTag, sig.Direction, sig.SpreadBps, sig.ZScore, sig.ExpectedProfit)
+	qty := t.config.Quantity
+	if sig.Quantity.GreaterThan(decimal.Zero) && sig.Quantity.LessThan(qty) {
+		qty = sig.Quantity
+	}
+	t.logger.Infof("%s EVT signal dir=%s edge=%+.1fbps z=%.2f profit=%+.1fbps qty=%s",
+		roundTag, sig.Direction, sig.SpreadBps, sig.ZScore, sig.ExpectedProfit, qty)
 
 	t.state = StatePlacingMaker
 	sigCopy := *sig
 	signalTime := now
 	t.mu.Unlock()
 
-	go t.openMakerTaker(&sigCopy, signalTime)
+	t.recordRoundEvent(runlog.Event{
+		At:                signalTime,
+		Type:              "signal",
+		Round:             roundID,
+		State:             string(StatePlacingMaker),
+		Direction:         string(sig.Direction),
+		Quantity:          qty.String(),
+		SpreadBps:         sig.SpreadBps,
+		ZScore:            sig.ZScore,
+		ExpectedProfitBps: sig.ExpectedProfit,
+	})
+
+	go t.openMakerTaker(&sigCopy, signalTime, roundID)
 }
 
-func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
+func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time, roundID int) {
 	if sig == nil {
 		return
 	}
@@ -123,6 +140,16 @@ func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
 	cid := exchanges.GenerateID()
 	makerSubmitAt := time.Now()
 	if t.makerAccount == nil {
+		t.evtErrorf("manual_intervention reason=%q", "maker trading account is not configured")
+		t.recordRoundEvent(runlog.Event{
+			At:       makerSubmitAt,
+			Type:     "manual_intervention",
+			Round:    roundID,
+			State:    string(StateManualIntervention),
+			Reason:   "maker trading account is not configured",
+			Detail:   "open_maker",
+			Quantity: qty.String(),
+		})
 		t.logger.Error("maker trading account is not configured")
 		t.resetOpenFlow(StateManualIntervention)
 		return
@@ -137,7 +164,7 @@ func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
 		ClientID:    cid,
 	})
 	if err != nil {
-		t.logger.Errorf("%s ❌ maker failed: %v", t.roundTag(), err)
+		t.logger.Errorf("%s maker placement failed: %v", t.roundTag(), err)
 		go telegram.Notify(fmt.Sprintf("❌ Maker order failed: %v", err))
 		t.resetOpenFlow(StateIdle)
 		return
@@ -177,9 +204,20 @@ func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
 	t.state = StateWaitingFill
 	t.mu.Unlock()
 
-	t.logger.Infof("%s 📌 maker %s %s %s qty=%s cid=%s (%dms)",
-		t.roundTag(), makerSide, t.config.MakerExchange, makerPrice, qty, cid,
+	t.evtInfof("maker_placed side=%s ex=%s px=%s qty=%s wait=%dms",
+		makerSide, t.config.MakerExchange, makerPrice, qty,
 		makerPlacedAt.Sub(signalTime).Milliseconds())
+	t.recordRoundEvent(runlog.Event{
+		At:       makerPlacedAt,
+		Type:     "maker_placed",
+		Round:    roundID,
+		State:    string(StateWaitingFill),
+		Side:     string(makerSide),
+		Exchange: t.config.MakerExchange,
+		Price:    makerPrice.String(),
+		Quantity: qty.String(),
+		WaitMS:   makerPlacedAt.Sub(signalTime).Milliseconds(),
+	})
 
 	timeout := time.NewTimer(t.config.MakerTimeout)
 	defer timeout.Stop()
@@ -296,6 +334,7 @@ func (t *Trader) cancelPendingMaker(ctx context.Context, reason string) error {
 		t.mu.Lock()
 		t.state = StateManualIntervention
 		t.mu.Unlock()
+		t.evtErrorf("manual_intervention reason=%q", "unable to resolve maker order for cancel")
 		return err
 	}
 	flow.makerOrder = resolvedOrder
@@ -338,6 +377,7 @@ func (t *Trader) cancelPendingMaker(ctx context.Context, reason string) error {
 			t.mu.Lock()
 			t.state = StateManualIntervention
 			t.mu.Unlock()
+			t.evtErrorf("manual_intervention reason=%q", "maker order status unknown after timeout")
 			return err
 		}
 		if order != nil {
@@ -601,7 +641,17 @@ func (t *Trader) handleMakerOrderUpdate(ctx context.Context, update *exchanges.O
 				t.openFlow.hedgeSnapshot = t.captureCurrentTradeBBO(t.openFlow.signal.Direction)
 			}
 			t.mu.Unlock()
-			t.logger.Infof("%s 🚨 hedge done (%dms)", t.roundTag(), hedgeDone.Sub(hedgeStart).Milliseconds())
+			t.evtInfof("hedge_done filled=%s wait=%dms", targetQty, hedgeDone.Sub(hedgeStart).Milliseconds())
+			t.recordRoundEvent(runlog.Event{
+				At:       hedgeDone,
+				Type:     "hedge_done",
+				Round:    t.roundID,
+				State:    string(StatePositionOpen),
+				Exchange: t.config.TakerExchange,
+				Side:     string(flow.takerSide),
+				Quantity: targetQty.String(),
+				WaitMS:   hedgeDone.Sub(hedgeStart).Milliseconds(),
+			})
 		}
 	}
 
@@ -655,11 +705,28 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 		ClientID: cid,
 	})
 	if err != nil {
-		t.logger.Errorf("%s ❌ hedge failed — UNHEDGED qty=%s: %v", t.roundTag(), delta, err)
+		t.evtErrorf("hedge_failed qty=%s err=%v", delta, err)
+		t.recordRoundEvent(runlog.Event{
+			At:       hedgeSubmitAt,
+			Type:     "hedge_failed",
+			Round:    t.roundID,
+			State:    string(StateHedging),
+			Quantity: delta.String(),
+			Detail:   err.Error(),
+		})
 		go telegram.Notify(fmt.Sprintf("🚨 HEDGE FAILED — UNHEDGED EXPOSURE!\nQty: %s\nErr: %v", delta, err))
 		t.mu.Lock()
 		t.state = StateManualIntervention
 		t.mu.Unlock()
+		t.evtErrorf("manual_intervention reason=%q", fmt.Sprintf("hedge failed for qty=%s", delta))
+		t.recordRoundEvent(runlog.Event{
+			At:       time.Now(),
+			Type:     "manual_intervention",
+			Round:    t.roundID,
+			State:    string(StateManualIntervention),
+			Reason:   fmt.Sprintf("hedge failed for qty=%s", delta),
+			Quantity: delta.String(),
+		})
 		return nil, err
 	}
 	if orderFlowFills(hedgeFlow) == nil {
@@ -680,11 +747,28 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 
 	if confirmed, verifyErr := t.waitTakerFill(ctx, hedgeFlow, hedgeOrder, delta); !confirmed {
 		errMsg := fmt.Sprintf("taker order rejected/unfilled: %v", verifyErr)
-		t.logger.Errorf("%s ❌ hedge REJECTED — UNHEDGED qty=%s: %s", t.roundTag(), delta, errMsg)
+		t.evtErrorf("hedge_failed qty=%s err=%s", delta, errMsg)
+		t.recordRoundEvent(runlog.Event{
+			At:       time.Now(),
+			Type:     "hedge_failed",
+			Round:    t.roundID,
+			State:    string(StateHedging),
+			Quantity: delta.String(),
+			Detail:   errMsg,
+		})
 		go telegram.Notify(fmt.Sprintf("🚨 HEDGE REJECTED — UNHEDGED!\nQty: %s\n%s", delta, errMsg))
 		t.mu.Lock()
 		t.state = StateManualIntervention
 		t.mu.Unlock()
+		t.evtErrorf("manual_intervention reason=%q", fmt.Sprintf("hedge rejected for qty=%s", delta))
+		t.recordRoundEvent(runlog.Event{
+			At:       time.Now(),
+			Type:     "manual_intervention",
+			Round:    t.roundID,
+			State:    string(StateManualIntervention),
+			Reason:   fmt.Sprintf("hedge rejected for qty=%s", delta),
+			Quantity: delta.String(),
+		})
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
@@ -748,7 +832,6 @@ func (t *Trader) waitTakerFill(ctx context.Context, flow *account.OrderFlow, ord
 			mergeOrderDetails(order, update)
 			switch update.Status {
 			case exchanges.OrderStatusFilled:
-				t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
 				return true, nil
 			case exchanges.OrderStatusPartiallyFilled:
 				continue
@@ -769,7 +852,6 @@ func (t *Trader) waitTakerFill(ctx context.Context, flow *account.OrderFlow, ord
 			if useFallbackFills {
 				mergeFillDetails(order, fill)
 				if order.Status == exchanges.OrderStatusFilled {
-					t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
 					return true, nil
 				}
 				continue
@@ -778,7 +860,6 @@ func (t *Trader) waitTakerFill(ctx context.Context, flow *account.OrderFlow, ord
 				mergeOrderDetails(order, latest)
 				switch latest.Status {
 				case exchanges.OrderStatusFilled:
-					t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
 					return true, nil
 				case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
 					return false, fmt.Errorf("status=%s", latest.Status)
@@ -813,8 +894,6 @@ func (t *Trader) verifyTakerPosition(ctx context.Context, expectedDelta decimal.
 			if strings.EqualFold(p.Symbol, t.config.Symbol) {
 				absQty := p.Quantity.Abs()
 				if absQty.GreaterThanOrEqual(totalExpected) {
-					t.logger.Infof("%s ✅ taker position verified: %s %s (expected >=%s)",
-						t.roundTag(), p.Side, absQty, totalExpected)
 					return true, nil
 				}
 				return false, fmt.Errorf("taker position %s < expected %s", absQty, totalExpected)
@@ -838,8 +917,6 @@ func (t *Trader) verifyTakerPosition(ctx context.Context, expectedDelta decimal.
 		if strings.EqualFold(p.Symbol, t.config.Symbol) {
 			absQty := p.Quantity.Abs()
 			if absQty.GreaterThanOrEqual(totalExpected) {
-				t.logger.Infof("%s ✅ taker position verified: %s %s (expected >=%s)",
-					t.roundTag(), p.Side, absQty, totalExpected)
 				return true, nil
 			}
 			return false, fmt.Errorf("taker position %s < expected %s", absQty, totalExpected)
@@ -884,9 +961,6 @@ func (t *Trader) finalizeOpenFlow(makerOrder *exchanges.Order, filledQty decimal
 	t.state = StatePositionOpen
 	t.openFlow = nil
 	t.mu.Unlock()
-
-	t.logger.Infof("%s ✅ opened  long=%s short=%s spread=%.1fbps qty=%s",
-		t.roundTag(), longName, shortName, flow.signal.SpreadBps, filledQty)
 
 	if t.position != nil && t.position.OpenRecap != nil {
 		t.logger.Infof("%s 📘 recap %s", t.roundTag(), t.position.OpenRecap.Summary())

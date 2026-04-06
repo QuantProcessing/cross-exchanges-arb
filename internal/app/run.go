@@ -15,16 +15,16 @@ import (
 	exchanges "github.com/QuantProcessing/exchanges"
 	"github.com/QuantProcessing/exchanges/account"
 	"github.com/QuantProcessing/notify/telegram"
-	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 var newExchangePair = appx.NewPair
 var nowFunc = time.Now
+var heartbeatInterval = 5 * time.Second
 
 // Run starts the arbitrage application and blocks until the context is done or the engine exits.
-func Run(ctx context.Context, cfg *appconfig.Config, logger *zap.SugaredLogger) error {
+func Run(ctx context.Context, cfg *appconfig.Config, logger *zap.SugaredLogger) (runErr error) {
 	if cfg == nil {
 		return fmt.Errorf("config is required")
 	}
@@ -40,12 +40,51 @@ func Run(ctx context.Context, cfg *appconfig.Config, logger *zap.SugaredLogger) 
 	}
 	defer session.Close()
 
+	var pnl *trading.PnLTracker
+	defer func() {
+		result := "completed"
+		detail := ""
+		switch {
+		case runErr != nil && ctx.Err() == nil:
+			result = "error"
+			detail = runErr.Error()
+		case ctx.Err() != nil:
+			result = "canceled"
+		}
+
+		rounds := 0
+		if pnl != nil {
+			rounds = pnl.RoundCount()
+		}
+
+		recordSessionEvent(logger, session.Events, runlog.Event{
+			At:            nowFunc(),
+			Category:      "session",
+			Type:          "stopped",
+			MakerExchange: cfg.MakerExchange,
+			TakerExchange: cfg.TakerExchange,
+			Symbol:        cfg.Symbol,
+			Result:        result,
+			Detail:        detail,
+			Rounds:        rounds,
+		})
+	}()
+
 	logger = teeRunLogger(logger, session.RunLogFile)
 	logger.Infow("run artifacts ready",
 		"dir", session.Dir,
 		"run_log", session.RunLogPath,
 		"raw", session.RawPath,
+		"events", session.EventsPath,
 	)
+	recordSessionEvent(logger, session.Events, runlog.Event{
+		At:            nowFunc(),
+		Category:      "session",
+		Type:          "started",
+		MakerExchange: cfg.MakerExchange,
+		TakerExchange: cfg.TakerExchange,
+		Symbol:        cfg.Symbol,
+	})
 
 	initTelegram(logger)
 	fmt.Println(cfg.String())
@@ -88,23 +127,25 @@ func Run(ctx context.Context, cfg *appconfig.Config, logger *zap.SugaredLogger) 
 	marketService.Subscribe(func(frame marketdata.MarketFrame) {
 		if err := recorder.Record(frame); err != nil {
 			logger.Warnw("raw recorder write failed", "err", err)
-			return
-		}
-		if snapshot := engine.Snapshot(); snapshot != nil {
-			logMarketSnapshot(logger, frame, snapshot)
 		}
 	})
 
 	trader := trading.NewTrader(maker, taker, makerAccount, takerAccount, engine, cfg, logger)
-	pnl := trading.NewPnLTracker(ctx, maker, taker, cfg.MakerExchange, cfg.TakerExchange, logger)
+	pnl = trading.NewPnLTracker(ctx, maker, taker, cfg.MakerExchange, cfg.TakerExchange, logger)
+	pnl.SetEventSink(session.Events)
 	trader.SetPnLTracker(pnl)
+	trader.SetEventSink(session.Events)
 	engine.SetSignalCallback(trader.HandleSignal)
 
 	if err := trader.Start(ctx); err != nil {
 		return fmt.Errorf("start trader: %w", err)
 	}
 
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+
 	logger.Infow("starting spread monitoring")
+	go runHeartbeatLoop(heartbeatCtx, logger, trader, engine, session.Events)
 
 	go telegram.Notify(fmt.Sprintf("🚀 Cross-Arb Started\n%s ↔ %s | %s\nQty: %s | MaxRounds: %d\nZ-Open: %.1f | Z-Close: %.1f | Z-Stop: %.1f\n──────────\n%s",
 		cfg.MakerExchange, cfg.TakerExchange, cfg.Symbol,
@@ -112,7 +153,8 @@ func Run(ctx context.Context, cfg *appconfig.Config, logger *zap.SugaredLogger) 
 		cfg.ZOpen, cfg.ZClose, cfg.ZStop,
 		pnl.StartupSummary()))
 
-	runErr := marketService.Start(ctx)
+	runErr = marketService.Start(ctx)
+	stopHeartbeat()
 	trader.GracefulShutdown(15 * time.Second)
 
 	go telegram.Notify(fmt.Sprintf("🛑 Cross-Arb Stopped\nRounds completed: %d", pnl.RoundCount()))
@@ -122,6 +164,10 @@ func Run(ctx context.Context, cfg *appconfig.Config, logger *zap.SugaredLogger) 
 		logger.Errorw("spread engine error", "err", runErr)
 	}
 	return nil
+}
+
+type heartbeatSnapshotter interface {
+	Snapshot() *spread.Snapshot
 }
 
 func teeRunLogger(base *zap.SugaredLogger, runLogFile *os.File) *zap.SugaredLogger {
@@ -142,39 +188,53 @@ func teeRunLogger(base *zap.SugaredLogger, runLogFile *os.File) *zap.SugaredLogg
 	return zap.New(zapcore.NewTee(base.Desugar().Core(), fileCore)).Sugar()
 }
 
-type marketStats struct {
-	SpreadABBps     float64
-	SpreadBABps     float64
-	MeanAB          float64
-	MeanBA          float64
-	StdAB           float64
-	StdBA           float64
-	ZAB             float64
-	ZBA             float64
-	MakerQuoteLagMS int64
-	TakerQuoteLagMS int64
-}
+func runHeartbeatLoop(ctx context.Context, logger *zap.SugaredLogger, trader *trading.Trader, snapshots heartbeatSnapshotter, events *runlog.EventSink) {
+	if logger == nil || trader == nil || snapshots == nil {
+		return
+	}
 
-func metricsStatsFromSnapshot(snapshot *spread.Snapshot, frame marketdata.MarketFrame) marketStats {
-	if snapshot == nil {
-		return marketStats{
-			MakerQuoteLagMS: quoteLagMS(frame.LocalTime, frame.MakerExchangeTS),
-			TakerQuoteLagMS: quoteLagMS(frame.LocalTime, frame.TakerExchangeTS),
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			status := trader.OperatorStatusSnapshot(now)
+			snapshot := snapshots.Snapshot()
+			logHeartbeat(logger, status, snapshot, now)
+			recordHealthEvent(logger, events, status, snapshot, now)
 		}
 	}
+}
 
-	return marketStats{
-		SpreadABBps:     roundBps(snapshot.SpreadAB),
-		SpreadBABps:     roundBps(snapshot.SpreadBA),
-		MeanAB:          roundBps(snapshot.MeanAB),
-		MeanBA:          roundBps(snapshot.MeanBA),
-		StdAB:           roundBps(snapshot.StdDevAB),
-		StdBA:           roundBps(snapshot.StdDevBA),
-		ZAB:             zScore(snapshot.SpreadAB, snapshot.MeanAB, snapshot.StdDevAB),
-		ZBA:             zScore(snapshot.SpreadBA, snapshot.MeanBA, snapshot.StdDevBA),
-		MakerQuoteLagMS: quoteLagMS(frame.LocalTime, frame.MakerExchangeTS),
-		TakerQuoteLagMS: quoteLagMS(frame.LocalTime, frame.TakerExchangeTS),
+func logHeartbeat(logger *zap.SugaredLogger, status trading.OperatorStatusSnapshot, snapshot *spread.Snapshot, now time.Time) {
+	if logger == nil {
+		return
 	}
+	if snapshot == nil {
+		logger.Infof(
+			"STAT safe=%s profit=%s blocked=%s state=%s rounds=%d market=warming",
+			status.Safe,
+			status.Profit,
+			status.Blocked,
+			status.State,
+			status.Rounds,
+		)
+		return
+	}
+
+	logger.Infof(
+		"STAT safe=%s profit=%s blocked=%s state=%s rounds=%d maker_lag=%dms taker_lag=%dms",
+		status.Safe,
+		status.Profit,
+		status.Blocked,
+		status.State,
+		status.Rounds,
+		quoteLagMS(now, snapshot.MakerTS),
+		quoteLagMS(now, snapshot.TakerTS),
+	)
 }
 
 func quoteLagMS(local, exchange time.Time) int64 {
@@ -184,38 +244,40 @@ func quoteLagMS(local, exchange time.Time) int64 {
 	return local.Sub(exchange).Milliseconds()
 }
 
-func zScore(value, mean, stddev float64) float64 {
-	if stddev < 1e-9 {
-		return 0
-	}
-	return (value - mean) / stddev
-}
-
-func roundBps(value float64) float64 {
-	rounded, _ := decimal.NewFromFloat(value).Round(1).Float64()
-	return rounded
-}
-
-func logMarketSnapshot(logger *zap.SugaredLogger, frame marketdata.MarketFrame, snapshot *spread.Snapshot) {
-	if logger == nil || snapshot == nil {
+func recordSessionEvent(logger *zap.SugaredLogger, events *runlog.EventSink, event runlog.Event) {
+	if events == nil {
 		return
 	}
-	stats := metricsStatsFromSnapshot(snapshot, frame)
+	if err := events.Record(event); err != nil && logger != nil {
+		logger.Warnw("event sink write failed", "category", event.Category, "type", event.Type, "err", err)
+	}
+}
 
-	logger.Infof(
-		"MKT updated=%s mbid=%s mbid_qty=%s mask=%s mask_qty=%s tbid=%s tbid_qty=%s task=%s task_qty=%s ab=%.1f ba=%.1f mean_ab=%.1f std_ab=%.1f z_ab=%.2f mean_ba=%.1f std_ba=%.1f z_ba=%.2f maker_lag=%dms taker_lag=%dms valid_ab=%t valid_ba=%t reason_ab=%q reason_ba=%q",
-		frame.UpdatedSide,
-		snapshot.MakerBid, snapshot.MakerBidQty,
-		snapshot.MakerAsk, snapshot.MakerAskQty,
-		snapshot.TakerBid, snapshot.TakerBidQty,
-		snapshot.TakerAsk, snapshot.TakerAskQty,
-		stats.SpreadABBps, stats.SpreadBABps,
-		stats.MeanAB, stats.StdAB, stats.ZAB,
-		stats.MeanBA, stats.StdBA, stats.ZBA,
-		stats.MakerQuoteLagMS, stats.TakerQuoteLagMS,
-		snapshot.ValidAB, snapshot.ValidBA,
-		snapshot.ReasonAB, snapshot.ReasonBA,
-	)
+func recordHealthEvent(logger *zap.SugaredLogger, events *runlog.EventSink, status trading.OperatorStatusSnapshot, snapshot *spread.Snapshot, now time.Time) {
+	if events == nil {
+		return
+	}
+
+	event := runlog.Event{
+		At:       now,
+		Category: "health",
+		Type:     "heartbeat",
+		Safe:     string(status.Safe),
+		Profit:   status.Profit,
+		Blocked:  status.Blocked,
+		State:    string(status.State),
+		Rounds:   status.Rounds,
+	}
+	if snapshot == nil {
+		event.Market = "warming"
+	} else {
+		event.MakerLagMS = quoteLagMS(now, snapshot.MakerTS)
+		event.TakerLagMS = quoteLagMS(now, snapshot.TakerTS)
+	}
+
+	if err := events.Record(event); err != nil && logger != nil {
+		logger.Warnw("event sink write failed", "category", event.Category, "type", event.Type, "err", err)
+	}
 }
 
 func initTelegram(logger *zap.SugaredLogger) {
