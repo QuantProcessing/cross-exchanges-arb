@@ -142,6 +142,9 @@ func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
 		t.resetOpenFlow(StateIdle)
 		return
 	}
+	if orderFlowFills(makerFlow) == nil {
+		t.ensureMakerFillNotifications()
+	}
 	makerOrder := makerFlow.Latest()
 	if makerOrder == nil {
 		makerOrder = &exchanges.Order{
@@ -181,6 +184,12 @@ func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
 	timeout := time.NewTimer(t.config.MakerTimeout)
 	defer timeout.Stop()
 	marketUpdateCh := t.ensureMarketUpdateNotifications()
+	makerFlowOrders := orderFlowOrders(makerFlow)
+	makerFlowFills := orderFlowFills(makerFlow)
+	useFallbackMakerFills := makerFlowFills == nil
+	if useFallbackMakerFills {
+		makerFlowFills = t.ensureMakerFillNotifications()
+	}
 
 	if cancel, reason := t.shouldCancelPendingMaker(); cancel {
 		if err := t.cancelPendingMaker(ctx, reason); err != nil {
@@ -191,12 +200,34 @@ func (t *Trader) openMakerTaker(sig *spread.Signal, signalTime time.Time) {
 
 	for {
 		select {
-		case update := <-t.makerOrderCh:
+		case update, ok := <-makerFlowOrders:
+			if !ok {
+				makerFlowOrders = nil
+				continue
+			}
 			if done, err := t.handleMakerOrderUpdate(ctx, update, makerOrder, cid, qty); err != nil {
 				t.logger.Errorf("%s maker update error: %v", t.roundTag(), err)
 				return
 			} else if done {
 				return
+			}
+		case fill, ok := <-makerFlowFills:
+			if !ok {
+				makerFlowFills = nil
+				continue
+			}
+			if !matchesOrderFill(makerOrder, fill) {
+				continue
+			}
+			t.observeFill(t.config.MakerExchange, fill)
+			if useFallbackMakerFills {
+				synthetic := mergeFillDetails(makerOrder, fill)
+				if done, err := t.handleMakerOrderUpdate(ctx, synthetic, makerOrder, cid, qty); err != nil {
+					t.logger.Errorf("%s maker fill error: %v", t.roundTag(), err)
+					return
+				} else if done {
+					return
+				}
 			}
 		case <-timeout.C:
 			if err := t.handleMakerTimeout(ctx); err != nil {
@@ -481,15 +512,48 @@ func (t *Trader) matchesOpenMakerOrder(update *exchanges.Order, makerOrder *exch
 }
 
 func (t *Trader) settleMakerFlow(ctx context.Context, flow *openFlowState) (bool, error) {
+	var ordersCh <-chan *exchanges.Order = t.makerOrderCh
+	var fillsCh <-chan *exchanges.Fill
+	useFallbackFills := false
+	if flow != nil && flow.makerFlow != nil {
+		ordersCh = orderFlowOrders(flow.makerFlow)
+		fillsCh = orderFlowFills(flow.makerFlow)
+	}
+	if fillsCh == nil {
+		fillsCh = t.ensureMakerFillNotifications()
+		useFallbackFills = true
+	}
 	for {
 		select {
-		case update := <-t.makerOrderCh:
+		case update, ok := <-ordersCh:
+			if !ok {
+				ordersCh = nil
+				continue
+			}
 			done, err := t.handleMakerOrderUpdate(ctx, update, flow.makerOrder, "", flow.makerQty)
 			if err != nil {
 				return false, err
 			}
 			if done {
 				return true, nil
+			}
+		case fill, ok := <-fillsCh:
+			if !ok {
+				fillsCh = nil
+				continue
+			}
+			if flow == nil || !matchesOrderFill(flow.makerOrder, fill) {
+				continue
+			}
+			t.observeFill(t.config.MakerExchange, fill)
+			if useFallbackFills {
+				done, err := t.handleMakerOrderUpdate(ctx, mergeFillDetails(flow.makerOrder, fill), flow.makerOrder, "", flow.makerQty)
+				if err != nil {
+					return false, err
+				}
+				if done {
+					return true, nil
+				}
 			}
 		case <-ctx.Done():
 			t.mu.Lock()
@@ -598,6 +662,9 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 		t.mu.Unlock()
 		return nil, err
 	}
+	if orderFlowFills(hedgeFlow) == nil {
+		t.ensureTakerFillNotifications()
+	}
 	hedgeOrder := hedgeFlow.Latest()
 	if hedgeOrder == nil {
 		hedgeOrder = &exchanges.Order{
@@ -611,7 +678,7 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 	}
 	t.registerOrderTrace("open_hedge", t.config.TakerExchange, hedgeOrder, hedgeSubmitAt, time.Now())
 
-	if confirmed, verifyErr := t.waitTakerFill(ctx, hedgeOrder, delta); !confirmed {
+	if confirmed, verifyErr := t.waitTakerFill(ctx, hedgeFlow, hedgeOrder, delta); !confirmed {
 		errMsg := fmt.Sprintf("taker order rejected/unfilled: %v", verifyErr)
 		t.logger.Errorf("%s ❌ hedge REJECTED — UNHEDGED qty=%s: %s", t.roundTag(), delta, errMsg)
 		go telegram.Notify(fmt.Sprintf("🚨 HEDGE REJECTED — UNHEDGED!\nQty: %s\n%s", delta, errMsg))
@@ -650,15 +717,28 @@ func (t *Trader) hedgeMakerDelta(ctx context.Context, makerOrder *exchanges.Orde
 	return hedgeOrder, nil
 }
 
-func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order, expectedDelta decimal.Decimal) (bool, error) {
+func (t *Trader) waitTakerFill(ctx context.Context, flow *account.OrderFlow, order *exchanges.Order, expectedDelta decimal.Decimal) (bool, error) {
 	if order == nil {
 		return false, fmt.Errorf("nil order")
 	}
 
 	timeout := time.After(10 * time.Second)
+	var ordersCh <-chan *exchanges.Order = t.takerOrderCh
+	if flow != nil {
+		ordersCh = orderFlowOrders(flow)
+	}
+	fillsCh := orderFlowFills(flow)
+	useFallbackFills := fillsCh == nil
+	if useFallbackFills {
+		fillsCh = t.ensureTakerFillNotifications()
+	}
 	for {
 		select {
-		case update := <-t.takerOrderCh:
+		case update, ok := <-ordersCh:
+			if !ok {
+				ordersCh = nil
+				continue
+			}
 			if update == nil {
 				continue
 			}
@@ -676,6 +756,33 @@ func (t *Trader) waitTakerFill(ctx context.Context, order *exchanges.Order, expe
 				return false, fmt.Errorf("status=%s", update.Status)
 			default:
 				continue
+			}
+		case fill, ok := <-fillsCh:
+			if !ok {
+				fillsCh = nil
+				continue
+			}
+			if !matchesOrderFill(order, fill) {
+				continue
+			}
+			t.observeFill(t.config.TakerExchange, fill)
+			if useFallbackFills {
+				mergeFillDetails(order, fill)
+				if order.Status == exchanges.OrderStatusFilled {
+					t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
+					return true, nil
+				}
+				continue
+			}
+			if latest := flow.Latest(); latest != nil {
+				mergeOrderDetails(order, latest)
+				switch latest.Status {
+				case exchanges.OrderStatusFilled:
+					t.logger.Infof("%s ✅ taker confirmed FILLED", t.roundTag())
+					return true, nil
+				case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
+					return false, fmt.Errorf("status=%s", latest.Status)
+				}
 			}
 		case <-timeout:
 			t.logger.Warnf("%s taker fill timeout, checking positions...", t.roundTag())

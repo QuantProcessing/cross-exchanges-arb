@@ -65,6 +65,10 @@ type Trader struct {
 	orderTraces     map[string]*orderTrace
 	makerOrdersSub  *account.Subscription[exchanges.Order]
 	takerOrdersSub  *account.Subscription[exchanges.Order]
+	makerFillCh     chan *exchanges.Fill
+	takerFillCh     chan *exchanges.Fill
+	makerFillsOnce  sync.Once
+	takerFillsOnce  sync.Once
 }
 
 var closeLegVerifyTimeout = 5 * time.Second

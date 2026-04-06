@@ -38,6 +38,7 @@ type testExchange struct {
 	fetchOrderErr     error
 	accountSnapshot   *exchanges.Account
 	watchOrdersCB     exchanges.OrderUpdateCallback
+	watchFillsCB      exchanges.FillCallback
 	watchPositionsCB  exchanges.PositionUpdateCallback
 	placeWSCalls      int
 	cancelWSCalls     int
@@ -211,9 +212,22 @@ func (e *testExchange) PlaceOrderWS(ctx context.Context, params *exchanges.Order
 	}
 	e.ordersByID[orderID] = cloneTestOrder(order)
 	cb := e.watchOrdersCB
+	fillCB := e.watchFillsCB
 	e.mu.Unlock()
 	if shouldEmit && cb != nil {
 		go cb(cloneTestOrder(order))
+	}
+	if shouldEmit && fillCB != nil && order.Status == exchanges.OrderStatusFilled && order.FilledQuantity.GreaterThan(decimal.Zero) {
+		go fillCB(&exchanges.Fill{
+			TradeID:       fmt.Sprintf("%s-fill-%d", e.name, e.placeWSCalls),
+			OrderID:       order.OrderID,
+			ClientOrderID: order.ClientOrderID,
+			Symbol:        order.Symbol,
+			Side:          order.Side,
+			Price:         order.Price,
+			Quantity:      order.FilledQuantity,
+			Timestamp:     time.Now().UnixMilli(),
+		})
 	}
 	return nil
 }
@@ -291,6 +305,9 @@ func (e *testExchange) WatchOrders(ctx context.Context, cb exchanges.OrderUpdate
 	return nil
 }
 func (e *testExchange) WatchFills(ctx context.Context, cb exchanges.FillCallback) error {
+	e.mu.Lock()
+	e.watchFillsCB = cb
+	e.mu.Unlock()
 	if e.watchFillsErr != nil {
 		return e.watchFillsErr
 	}
@@ -343,6 +360,15 @@ func (e *testExchange) emitPositionUpdate(position *exchanges.Position) {
 	e.mu.Unlock()
 	if cb != nil {
 		cb(position)
+	}
+}
+
+func (e *testExchange) emitFill(fill *exchanges.Fill) {
+	e.mu.Lock()
+	cb := e.watchFillsCB
+	e.mu.Unlock()
+	if cb != nil {
+		cb(fill)
 	}
 }
 
@@ -551,12 +577,12 @@ func TestTrader_CancelsPendingMakerWhenEntryEdgeDisappears(t *testing.T) {
 	cancelOrderID := maker.lastCancelOrder
 	maker.mu.Unlock()
 
-	tr.makerOrderCh <- &exchanges.Order{
+	maker.emitOrderUpdate(&exchanges.Order{
 		OrderID:        cancelOrderID,
 		ClientOrderID:  makerClientID,
 		Status:         exchanges.OrderStatusCancelled,
 		FilledQuantity: decimal.Zero,
-	}
+	})
 
 	waitForTraderState(t, tr, StateIdle)
 	if tr.openFlow != nil {
@@ -648,7 +674,6 @@ func TestTrader_CancelPendingMakerWaitsForResolvableOrderID(t *testing.T) {
 			Status:        exchanges.OrderStatusCancelled,
 		}
 		maker.emitOrderUpdate(update)
-		tr.makerOrderCh <- update
 	}()
 
 	if err := tr.cancelPendingMaker(context.Background(), "test"); err != nil {
@@ -839,11 +864,11 @@ func TestTrader_CloseUsesExecutedOpenQuantityAfterPartialFill(t *testing.T) {
 		makerClientID = tr.openFlow.makerOrder.ClientOrderID
 	}
 	tr.mu.Unlock()
-	tr.makerOrderCh <- &exchanges.Order{
+	maker.emitOrderUpdate(&exchanges.Order{
 		ClientOrderID:  makerClientID,
 		Status:         exchanges.OrderStatusPartiallyFilled,
 		FilledQuantity: decimal.RequireFromString("0.001"),
-	}
+	})
 	waitForTraderState(t, tr, StateWaitingFill)
 	tr.finalizeOpenFlow(tr.openFlow.makerOrder, decimal.RequireFromString("0.001"))
 	waitForMakerOrders(t, maker, 1)
@@ -912,6 +937,77 @@ func TestTrader_OpenUsesSignalQuantityWhenProvided(t *testing.T) {
 	}
 }
 
+func TestTrader_OpenHedgesFromMakerFlowFillWithoutOrderUpdate(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	logger := zap.New(core).Sugar()
+
+	tr, maker, taker := newActiveFlowTrader()
+	tr.logger = logger
+	maker.autoEmitWS = true
+	taker.autoEmitWS = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := tr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	tr.HandleSignal(&spread.Signal{
+		Direction:      spread.LongMakerShortTaker,
+		SpreadBps:      12.5,
+		ZScore:         2.1,
+		ExpectedProfit: 4.2,
+		MakerAsk:       decimal.RequireFromString("100"),
+		MakerBid:       decimal.RequireFromString("99"),
+		TakerBid:       decimal.RequireFromString("101"),
+		TakerAsk:       decimal.RequireFromString("102"),
+	})
+
+	waitForTraderState(t, tr, StateWaitingFill)
+
+	tr.mu.Lock()
+	makerOrder := cloneTestOrder(tr.openFlow.makerOrder)
+	makerQty := tr.openFlow.makerQty
+	tr.mu.Unlock()
+	if makerOrder == nil {
+		t.Fatal("expected maker order to be tracked")
+	}
+
+	maker.emitFill(&exchanges.Fill{
+		TradeID:       "maker-fill-1",
+		OrderID:       makerOrder.OrderID,
+		ClientOrderID: makerOrder.ClientOrderID,
+		Symbol:        "BTC",
+		Side:          makerOrder.Side,
+		Price:         decimal.RequireFromString("99.91"),
+		Quantity:      makerQty,
+		Fee:           decimal.RequireFromString("0.01"),
+		FeeAsset:      "USDC",
+		Timestamp:     time.Now().UnixMilli(),
+	})
+
+	waitForCondition(t, time.Second, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return tr.position != nil
+	}, "expected fill-only OrderFlow update to open position")
+
+	taker.mu.Lock()
+	gotOrders := append([]*exchanges.OrderParams(nil), taker.placedOrders...)
+	taker.mu.Unlock()
+	if len(gotOrders) != 1 {
+		t.Fatalf("taker order count = %d, want 1 hedge order", len(gotOrders))
+	}
+	if !gotOrders[0].Quantity.Equal(makerQty) {
+		t.Fatalf("hedge qty = %s, want %s", gotOrders[0].Quantity, makerQty)
+	}
+
+	fillLogs := observed.FilterMessageSnippet("💱 open_maker maker fill").All()
+	if len(fillLogs) != 1 {
+		t.Fatalf("maker fill logs = %d, want 1", len(fillLogs))
+	}
+}
+
 func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	tr, maker, taker := newActiveFlowTrader()
 	maker.autoEmitWS = true
@@ -960,6 +1056,76 @@ func TestTrader_GracefulShutdownClosesOpenPosition(t *testing.T) {
 	}
 	if !takerOrders[0].ReduceOnly {
 		t.Fatal("taker shutdown close must be reduce-only")
+	}
+}
+
+func TestTrader_CloseUsesOrderFlowFillWithoutOrderUpdates(t *testing.T) {
+	tr := newTestTraderWithPosition()
+	maker, ok := tr.maker.(*testExchange)
+	if !ok {
+		t.Fatal("maker should be testExchange")
+	}
+	taker, ok := tr.taker.(*testExchange)
+	if !ok {
+		t.Fatal("taker should be testExchange")
+	}
+	maker.autoEmitWS = false
+	taker.autoEmitWS = false
+
+	done := make(chan struct{})
+	go func() {
+		tr.closePosition("fill-only-close")
+		close(done)
+	}()
+
+	waitForCondition(t, time.Second, func() bool {
+		maker.mu.Lock()
+		makerCount := len(maker.placedOrders)
+		maker.mu.Unlock()
+		taker.mu.Lock()
+		takerCount := len(taker.placedOrders)
+		taker.mu.Unlock()
+		return makerCount == 1 && takerCount == 1
+	}, "expected close orders to be placed")
+
+	maker.mu.Lock()
+	makerParams := *maker.placedOrders[0]
+	maker.mu.Unlock()
+	taker.mu.Lock()
+	takerParams := *taker.placedOrders[0]
+	taker.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	maker.emitFill(&exchanges.Fill{
+		TradeID:       "close-maker-fill-1",
+		ClientOrderID: makerParams.ClientID,
+		Symbol:        makerParams.Symbol,
+		Side:          makerParams.Side,
+		Price:         decimal.RequireFromString("100.5"),
+		Quantity:      makerParams.Quantity,
+		Timestamp:     now,
+	})
+	taker.emitFill(&exchanges.Fill{
+		TradeID:       "close-taker-fill-1",
+		ClientOrderID: takerParams.ClientID,
+		Symbol:        takerParams.Symbol,
+		Side:          takerParams.Side,
+		Price:         decimal.RequireFromString("100.4"),
+		Quantity:      takerParams.Quantity,
+		Timestamp:     now,
+	})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closePosition did not finish after fill-only OrderFlow updates")
+	}
+
+	if tr.position != nil {
+		t.Fatal("position should be closed")
+	}
+	if tr.state != StateCooldown {
+		t.Fatalf("state = %s, want cooldown", tr.state)
 	}
 }
 
@@ -1314,7 +1480,7 @@ func TestTrader_VerifyCloseLegUsesFetchFallback(t *testing.T) {
 	ok, err := tr.verifyCloseLeg(context.Background(), &exchanges.Order{
 		OrderID: "maker-close",
 		Status:  exchanges.OrderStatusPending,
-	}, tr.makerOrderCh, tr.takerOrderCh, true)
+	}, nil, tr.makerOrderCh, tr.takerOrderCh, true)
 	if err != nil {
 		t.Fatalf("verifyCloseLeg error = %v, want nil", err)
 	}
@@ -1337,7 +1503,7 @@ func TestTrader_VerifyCloseLegFailsWhenFetchCannotConfirm(t *testing.T) {
 	ok, err := tr.verifyCloseLeg(context.Background(), &exchanges.Order{
 		OrderID: "maker-close",
 		Status:  exchanges.OrderStatusPending,
-	}, tr.makerOrderCh, tr.takerOrderCh, true)
+	}, nil, tr.makerOrderCh, tr.takerOrderCh, true)
 	if err == nil {
 		t.Fatal("verifyCloseLeg error = nil, want error")
 	}

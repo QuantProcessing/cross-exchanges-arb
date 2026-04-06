@@ -25,6 +25,7 @@ type testExchange struct {
 	emitInitialBook     bool
 	fetchAccountCalls   int
 	watchOrdersCalls    int
+	watchFillsCalls     int
 	watchPositionsCalls int
 }
 
@@ -124,7 +125,7 @@ func (e *testExchange) WatchOrders(ctx context.Context, cb exchanges.OrderUpdate
 	return e.watchOrdersErr
 }
 func (e *testExchange) WatchFills(ctx context.Context, cb exchanges.FillCallback) error {
-	<-ctx.Done()
+	e.watchFillsCalls++
 	return nil
 }
 func (e *testExchange) WatchPositions(ctx context.Context, cb exchanges.PositionUpdateCallback) error {
@@ -258,6 +259,9 @@ func TestRun_StartsTradingAccounts(t *testing.T) {
 	}
 	if maker.watchOrdersCalls == 0 || taker.watchOrdersCalls == 0 {
 		t.Fatalf("WatchOrders calls maker=%d taker=%d, want both > 0", maker.watchOrdersCalls, taker.watchOrdersCalls)
+	}
+	if maker.watchFillsCalls == 0 || taker.watchFillsCalls == 0 {
+		t.Fatalf("WatchFills calls maker=%d taker=%d, want both > 0", maker.watchFillsCalls, taker.watchFillsCalls)
 	}
 	if maker.watchPositionsCalls == 0 || taker.watchPositionsCalls == 0 {
 		t.Fatalf("WatchPositions calls maker=%d taker=%d, want both > 0", maker.watchPositionsCalls, taker.watchPositionsCalls)

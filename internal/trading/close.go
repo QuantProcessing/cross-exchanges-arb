@@ -144,6 +144,7 @@ func (t *Trader) closePosition(reason string) {
 	type closeLegResult struct {
 		leg   string
 		order *exchanges.Order
+		flow  *account.OrderFlow
 		err   error
 	}
 	errCh := make(chan closeLegResult, 2)
@@ -151,7 +152,7 @@ func (t *Trader) closePosition(reason string) {
 	go func() {
 		defer wg.Done()
 		submitAt := time.Now()
-		order, err := t.placeWSOrder(ctx, longAccount, &exchanges.OrderParams{
+		order, flow, err := t.placeWSOrder(ctx, longAccount, &exchanges.OrderParams{
 			Symbol:     t.config.Symbol,
 			Side:       exchanges.OrderSideSell,
 			Type:       exchanges.OrderTypeMarket,
@@ -162,13 +163,13 @@ func (t *Trader) closePosition(reason string) {
 		if err == nil {
 			t.registerOrderTrace("close_long", exchangeName(longExchange), order, submitAt, time.Now())
 		}
-		errCh <- closeLegResult{leg: "long", order: order, err: err}
+		errCh <- closeLegResult{leg: "long", order: order, flow: flow, err: err}
 	}()
 
 	go func() {
 		defer wg.Done()
 		submitAt := time.Now()
-		order, err := t.placeWSOrder(ctx, shortAccount, &exchanges.OrderParams{
+		order, flow, err := t.placeWSOrder(ctx, shortAccount, &exchanges.OrderParams{
 			Symbol:     t.config.Symbol,
 			Side:       exchanges.OrderSideBuy,
 			Type:       exchanges.OrderTypeMarket,
@@ -179,7 +180,7 @@ func (t *Trader) closePosition(reason string) {
 		if err == nil {
 			t.registerOrderTrace("close_short", exchangeName(shortExchange), order, submitAt, time.Now())
 		}
-		errCh <- closeLegResult{leg: "short", order: order, err: err}
+		errCh <- closeLegResult{leg: "short", order: order, flow: flow, err: err}
 	}()
 
 	wg.Wait()
@@ -209,7 +210,7 @@ func (t *Trader) closePosition(reason string) {
 			useMaker = pos.Direction == spread.LongTakerShortMaker
 		}
 
-		confirmed, verifyErr := t.verifyCloseLeg(ctx, res.order, t.makerOrderCh, t.takerOrderCh, useMaker)
+		confirmed, verifyErr := t.verifyCloseLeg(ctx, res.order, res.flow, t.makerOrderCh, t.takerOrderCh, useMaker)
 		if confirmed {
 			continue
 		}
@@ -244,7 +245,7 @@ func (t *Trader) closePosition(reason string) {
 			} else {
 				accountRef = shortAccount
 			}
-			retryOrder, retryErr := t.placeWSOrder(retryCtx, accountRef, &exchanges.OrderParams{
+			retryOrder, retryFlow, retryErr := t.placeWSOrder(retryCtx, accountRef, &exchanges.OrderParams{
 				Symbol:     t.config.Symbol,
 				Side:       side,
 				Type:       exchanges.OrderTypeMarket,
@@ -257,13 +258,13 @@ func (t *Trader) closePosition(reason string) {
 				failures = append(failures, fmt.Sprintf("%s leg (retry): %v", leg, retryErr))
 			} else {
 				t.logger.Infof("%s ✅ %s leg retry ok", t.roundTag(), leg)
-				results[leg] = closeLegResult{leg: leg, order: retryOrder}
+				results[leg] = closeLegResult{leg: leg, order: retryOrder, flow: retryFlow}
 				if leg == "long" {
-					if confirmed, _ := t.verifyCloseLeg(retryCtx, retryOrder, t.makerOrderCh, t.takerOrderCh, pos.Direction == spread.LongMakerShortTaker); !confirmed {
+					if confirmed, _ := t.verifyCloseLeg(retryCtx, retryOrder, retryFlow, t.makerOrderCh, t.takerOrderCh, pos.Direction == spread.LongMakerShortTaker); !confirmed {
 						failures = append(failures, fmt.Sprintf("%s leg retry unconfirmed", leg))
 					}
 				} else {
-					if confirmed, _ := t.verifyCloseLeg(retryCtx, retryOrder, t.makerOrderCh, t.takerOrderCh, pos.Direction == spread.LongTakerShortMaker); !confirmed {
+					if confirmed, _ := t.verifyCloseLeg(retryCtx, retryOrder, retryFlow, t.makerOrderCh, t.takerOrderCh, pos.Direction == spread.LongTakerShortMaker); !confirmed {
 						failures = append(failures, fmt.Sprintf("%s leg retry unconfirmed", leg))
 					}
 				}
@@ -313,12 +314,12 @@ func (t *Trader) closePosition(reason string) {
 		t.roundTag(), reason, time.Since(pos.OpenTime).Round(time.Second)))
 }
 
-func (t *Trader) placeWSOrder(ctx context.Context, acc *account.TradingAccount, params *exchanges.OrderParams, phase string) (*exchanges.Order, error) {
+func (t *Trader) placeWSOrder(ctx context.Context, acc *account.TradingAccount, params *exchanges.OrderParams, phase string) (*exchanges.Order, *account.OrderFlow, error) {
 	if acc == nil {
-		return nil, fmt.Errorf("%s trading account is not configured", phase)
+		return nil, nil, fmt.Errorf("%s trading account is not configured", phase)
 	}
 	if params == nil {
-		return nil, fmt.Errorf("%s params are required", phase)
+		return nil, nil, fmt.Errorf("%s params are required", phase)
 	}
 	paramsCopy := *params
 	if paramsCopy.ClientID == "" {
@@ -326,7 +327,15 @@ func (t *Trader) placeWSOrder(ctx context.Context, acc *account.TradingAccount, 
 	}
 	flow, err := acc.PlaceWS(ctx, &paramsCopy)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if orderFlowFills(flow) == nil {
+		switch acc {
+		case t.makerAccount:
+			t.ensureMakerFillNotifications()
+		case t.takerAccount:
+			t.ensureTakerFillNotifications()
+		}
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
@@ -334,10 +343,29 @@ func (t *Trader) placeWSOrder(ctx context.Context, acc *account.TradingAccount, 
 		return order != nil && (order.OrderID != "" || order.Status != exchanges.OrderStatusPending)
 	})
 	if waitErr != nil {
-		order = flow.Latest()
+		drainCtx, drainCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer drainCancel()
+		for order == nil || (order.OrderID == "" && order.Status == exchanges.OrderStatusPending) {
+			select {
+			case update, ok := <-orderFlowOrders(flow):
+				if !ok {
+					order = nil
+					goto drained
+				}
+				if update != nil {
+					order = update
+				}
+			case <-drainCtx.Done():
+				goto drained
+			}
+		}
+	drained:
+		if latest := flow.Latest(); latest != nil && (order == nil || latest.Status != exchanges.OrderStatusPending || latest.OrderID != "") {
+			order = latest
+		}
 	}
 	if order != nil {
-		return order, nil
+		return order, flow, nil
 	}
 	return &exchanges.Order{
 		ClientOrderID: paramsCopy.ClientID,
@@ -347,41 +375,68 @@ func (t *Trader) placeWSOrder(ctx context.Context, acc *account.TradingAccount, 
 		Quantity:      paramsCopy.Quantity,
 		Status:        exchanges.OrderStatusPending,
 		ReduceOnly:    paramsCopy.ReduceOnly,
-	}, nil
+	}, flow, nil
 }
 
-func (t *Trader) verifyCloseLeg(ctx context.Context, order *exchanges.Order, makerCh, takerCh chan *exchanges.Order, useMaker bool) (bool, error) {
+func (t *Trader) verifyCloseLeg(ctx context.Context, order *exchanges.Order, flow *account.OrderFlow, makerCh, takerCh chan *exchanges.Order, useMaker bool) (bool, error) {
 	if order == nil {
 		return false, fmt.Errorf("nil order")
 	}
 
 	ch := takerCh
 	exchange := t.taker
+	exchangeName := t.config.TakerExchange
 	if useMaker {
 		ch = makerCh
 		exchange = t.maker
+		exchangeName = t.config.MakerExchange
 	}
 
-	_, err := t.confirmOrderFilled(ctx, exchange, order, ch, closeLegVerifyTimeout)
+	_, err := t.confirmOrderFilled(ctx, exchange, exchangeName, order, flow, ch, closeLegVerifyTimeout)
 	if err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (t *Trader) confirmOrderFilled(ctx context.Context, exchange exchanges.Exchange, order *exchanges.Order, ch <-chan *exchanges.Order, timeout time.Duration) (*exchanges.Order, error) {
+func (t *Trader) confirmOrderFilled(ctx context.Context, exchange exchanges.Exchange, exchangeName string, order *exchanges.Order, flow *account.OrderFlow, ch <-chan *exchanges.Order, timeout time.Duration) (*exchanges.Order, error) {
 	if order == nil {
 		return nil, fmt.Errorf("nil order")
 	}
 	if order.Status == exchanges.OrderStatusFilled {
 		return order, nil
 	}
+	if flow != nil {
+		if latest := flow.Latest(); latest != nil {
+			mergeOrderDetails(order, latest)
+			if order.Status == exchanges.OrderStatusFilled {
+				return order, nil
+			}
+		}
+	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	ordersCh := ch
+	if flow != nil {
+		ordersCh = orderFlowOrders(flow)
+	}
+	fillsCh := orderFlowFills(flow)
+	useFallbackFills := fillsCh == nil
+	if useFallbackFills {
+		if exchangeName == t.config.MakerExchange {
+			fillsCh = t.ensureMakerFillNotifications()
+		} else {
+			fillsCh = t.ensureTakerFillNotifications()
+		}
+	}
 	for {
 		select {
-		case update := <-ch:
+		case update, ok := <-ordersCh:
+			if !ok {
+				ordersCh = nil
+				continue
+			}
 			if update == nil {
 				continue
 			}
@@ -394,6 +449,34 @@ func (t *Trader) confirmOrderFilled(ctx context.Context, exchange exchanges.Exch
 			}
 			if update.Status == exchanges.OrderStatusCancelled || update.Status == exchanges.OrderStatusRejected {
 				return nil, fmt.Errorf("status=%s", update.Status)
+			}
+		case fill, ok := <-fillsCh:
+			if !ok {
+				fillsCh = nil
+				continue
+			}
+			if !matchesOrderFill(order, fill) {
+				continue
+			}
+			t.observeFill(exchangeName, fill)
+			if useFallbackFills {
+				mergeFillDetails(order, fill)
+				switch order.Status {
+				case exchanges.OrderStatusFilled:
+					return order, nil
+				case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
+					return nil, fmt.Errorf("status=%s", order.Status)
+				}
+				continue
+			}
+			if latest := flow.Latest(); latest != nil {
+				mergeOrderDetails(order, latest)
+				switch latest.Status {
+				case exchanges.OrderStatusFilled:
+					return order, nil
+				case exchanges.OrderStatusCancelled, exchanges.OrderStatusRejected:
+					return nil, fmt.Errorf("status=%s", latest.Status)
+				}
 			}
 		case <-timer.C:
 			snapshot, err := t.fetchOrderSnapshot(ctx, exchange, order)

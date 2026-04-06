@@ -8,6 +8,8 @@ github.com/QuantProcessing/exchanges v0.2.8 h1:5HNjK21g1rWLSy8s8PjW2IK9a4rZN2juU
 github.com/QuantProcessing/exchanges v0.2.8/go.mod h1:3+vaEeL+nf3M3VSGcVWyGj2WWfnIvP4ue0uzd/dyVvs=
 github.com/QuantProcessing/exchanges v0.2.10 h1:7SAR2WpIc2c1Z94VXsDLvqQ/uRUNsozcCS8RUP4lbew=
 github.com/QuantProcessing/exchanges v0.2.10/go.mod h1:3+vaEeL+nf3M3VSGcVWyGj2WWfnIvP4ue0uzd/dyVvs=
+github.com/QuantProcessing/exchanges v0.2.11 h1:mO+lJj7MGbFSYl7g8p/YqIZ7mVsH/t8HrXe1QajtCkg=
+github.com/QuantProcessing/exchanges v0.2.11/go.mod h1:3+vaEeL+nf3M3VSGcVWyGj2WWfnIvP4ue0uzd/dyVvs=
 github.com/QuantProcessing/notify v0.1.0 h1:Q0wvcWEpI5LnMwogGt7lrgqegchBj5lq8W8cozkLHls=
 github.com/QuantProcessing/notify v0.1.0/go.mod h1:WnL5r9OZ8p1blJ+QDpW+2XXHQV4e6RIFR7i2uUWBw/8=
 github.com/StackExchange/wmi v1.2.1 h1:VIkavFPXSjcnS+O8yTq7NI32k0R5Aj+v39y29VYDOSA=
