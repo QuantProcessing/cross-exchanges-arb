@@ -36,17 +36,13 @@ func TestConfigString_ShowsValidationKnobsWithoutClaimingValidationMode(t *testi
 		TakerExchange: "LIGHTER",
 		Symbol:        "BTC",
 		Quantity:      decimal.RequireFromString("0.001"),
-		LiveValidate:  true,
 		MakerTimeout:  20 * time.Second,
 		MaxRounds:     2,
 	}
 
 	summary := cfg.String()
-	if strings.Contains(summary, "LIVE VALIDATION") {
-		t.Fatal("startup summary must not claim live validation as the active runtime mode")
-	}
-	if !strings.Contains(summary, "ValidationCfg: ENABLED") {
-		t.Fatal("startup summary should expose validation config state")
+	if strings.Contains(summary, "Mode:") {
+		t.Fatal("startup summary must not expose runtime mode selection")
 	}
 	if !strings.Contains(summary, "MakerTimeout: 20s") {
 		t.Fatal("startup summary should show maker timeout")

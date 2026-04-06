@@ -24,3 +24,14 @@ cross-arb.log
 
 # Data files
 spread_*.csv
+
+# omx
+AGENTS.md
+.codex
+.omx
+
+# dist
+dist
+
+# log
+logs
