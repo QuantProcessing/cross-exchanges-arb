@@ -230,7 +230,7 @@ Phase 1 focuses on:
 - AB / BA spread overview for whole-run anomaly scanning
 - linked detail inspection for a selected time window
 - interactive threshold-duration analysis
-- interactive histogram distribution analysis
+- interactive histogram distribution analysis with per-bucket count labels
 
 ### Run the site
 
@@ -260,6 +260,12 @@ On startup the backend scans `logs/**/raw.jsonl`, imports normalized spread poin
 - direction-level summary metrics for AB and BA
 - threshold intervals with start/end timestamp, duration, and peak spread
 - histogram buckets at the requested bucket size
+
+### Current UI behavior
+
+- large runs are downsampled for chart rendering so the overview/detail charts stay responsive
+- histogram charts preserve the requested full bucket layout and render the count above each bar
+- uploads are optional; existing `logs/**/raw.jsonl` runs appear automatically after startup ingestion
 
 ### Future backtest seam
 
