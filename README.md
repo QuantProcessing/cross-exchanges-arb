@@ -218,7 +218,61 @@ pm2 stop cross-arb
 
 ```bash
 go test ./...
+python3 -m unittest tests.test_spread_analyze tests.test_spread_web tests.test_spread_backtest -v
 ```
+
+## Spread Analysis Assistant Site
+
+This repo includes a Python standard-library spread-analysis site for turning `raw.jsonl` logs into a single-run research workbench.
+
+Phase 1 focuses on:
+
+- AB / BA spread overview for whole-run anomaly scanning
+- linked detail inspection for a selected time window
+- interactive threshold-duration analysis
+- interactive histogram distribution analysis
+
+### Run the site
+
+```bash
+python3 -m webapp.server \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --db-path data/spread-analysis.db \
+  --logs-dir logs \
+  --upload-dir data/uploads
+```
+
+Then open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+On startup the backend scans `logs/**/raw.jsonl`, imports normalized spread points into SQLite, and serves a static browser UI from `webapp/static/`.
+
+### API surface
+
+- `GET /api/runs`
+- `GET /api/runs/<run_id>`
+- `GET /api/runs/<run_id>/points`
+- `GET /api/runs/<run_id>/analysis?threshold_bps=10&bucket_size_bps=1`
+- `POST /api/uploads` with the raw file body and `X-Filename: your-file.jsonl`
+
+`/api/runs/<run_id>/analysis` recomputes research metrics from persisted spread points rather than rereading `raw.jsonl` on every request. The response includes:
+
+- direction-level summary metrics for AB and BA
+- threshold intervals with start/end timestamp, duration, and peak spread
+- histogram buckets at the requested bucket size
+
+### Future backtest seam
+
+The site persists normalized derived spread points per run:
+
+- `ts_local`
+- `symbol`
+- `maker_exchange`
+- `taker_exchange`
+- `spread_ab_bps`
+- `spread_ba_bps`
+
+That stored point contract is intended to be the bridge into future browser-triggered backtest workflows, so later backtest work can reuse the same imported dataset instead of rebuilding ingestion from scratch.
 
 ## Project Structure
 
@@ -230,6 +284,7 @@ go test ./...
 │   ├── exchange/           # Exchange registry wiring and credential mapping
 │   ├── spread/             # Rolling stats, BBO monitoring, signal generation
 │   └── trading/            # Trader state machine, execution, PnL tracking
+├── webapp/                 # Python stdlib spread-analysis backend + static UI
 ├── ecosystem.config.js     # PM2 process manager config
 ├── .env.example            # Environment variable template
 └── .gitignore

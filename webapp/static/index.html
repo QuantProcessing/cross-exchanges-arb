@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Spread Analysis Assistant</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="sidebar-block">
+          <p class="eyebrow">Spread Research Workbench</p>
+          <h1>Spread Analysis Assistant</h1>
+          <p class="muted">
+            Load one run, scan the full session for anomalies, then drill into
+            the exact window where the spread regime changed.
+          </p>
+        </div>
+
+        <div class="sidebar-block">
+          <label class="label" for="run-select">Run</label>
+          <select id="run-select"></select>
+          <div id="run-meta" class="meta-list"></div>
+        </div>
+
+        <div class="sidebar-block">
+          <label class="label" for="upload-input">Import raw.jsonl</label>
+          <input id="upload-input" type="file" accept=".jsonl" />
+          <button id="upload-button" type="button">Upload</button>
+          <p class="muted" id="upload-status">Optional: import another run.</p>
+        </div>
+
+        <div class="sidebar-block">
+          <label class="label" for="threshold-input">Threshold (bps)</label>
+          <input id="threshold-input" type="number" min="0" step="0.5" value="10" />
+
+          <label class="label" for="bucket-input">Bucket Size (bps)</label>
+          <input id="bucket-input" type="number" min="0.5" step="0.5" value="1" />
+
+          <button id="refresh-analysis" type="button">Refresh Analysis</button>
+        </div>
+
+        <div class="sidebar-block">
+          <p class="label">Detail Window</p>
+          <label class="range-label" for="detail-start">Start</label>
+          <input id="detail-start" type="range" min="0" max="0" value="0" />
+          <label class="range-label" for="detail-end">End</label>
+          <input id="detail-end" type="range" min="0" max="0" value="0" />
+          <p class="muted" id="selection-label">No run selected.</p>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section class="hero">
+          <div>
+            <p class="eyebrow">Overview</p>
+            <h2 id="hero-title">No run selected</h2>
+          </div>
+          <div class="legend">
+            <span><i class="swatch ab"></i> AB spread</span>
+            <span><i class="swatch ba"></i> BA spread</span>
+          </div>
+        </section>
+
+        <section id="status-banner" class="status-banner">Loading runs...</section>
+
+        <section class="grid two-col">
+          <article class="panel chart-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Full Session</p>
+                <h3>Overview Chart</h3>
+              </div>
+              <p class="muted">Drag across the chart or use the sliders to refocus the detail panel.</p>
+            </div>
+            <div id="overview-chart" class="chart-host"></div>
+          </article>
+
+          <article class="panel chart-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Focused Interval</p>
+                <h3>Detail Chart</h3>
+              </div>
+              <p class="muted">The selected slice of the run, with the same AB / BA scale.</p>
+            </div>
+            <div id="detail-chart" class="chart-host"></div>
+          </article>
+        </section>
+
+        <section class="grid two-col">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Threshold Duration</p>
+                <h3>AB Direction</h3>
+              </div>
+            </div>
+            <div id="ab-summary"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Threshold Duration</p>
+                <h3>BA Direction</h3>
+              </div>
+            </div>
+            <div id="ba-summary"></div>
+          </article>
+        </section>
+
+        <section class="grid two-col">
+          <article class="panel chart-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Distribution</p>
+                <h3>AB Histogram</h3>
+              </div>
+            </div>
+            <div id="ab-histogram" class="histogram-host"></div>
+          </article>
+
+          <article class="panel chart-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Distribution</p>
+                <h3>BA Histogram</h3>
+              </div>
+            </div>
+            <div id="ba-histogram" class="histogram-host"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
