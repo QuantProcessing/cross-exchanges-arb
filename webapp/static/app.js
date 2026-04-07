@@ -343,9 +343,11 @@ function renderHistogram(host, label, buckets) {
           const barHeight = (bucket.count / maxCount) * innerHeight;
           const y = padding.top + innerHeight - barHeight;
           const color = label === "AB" ? "var(--ab)" : "var(--ba)";
+          const axisLabel = bucket.lower_bps.toFixed(0);
           return `
             <rect x="${x}" y="${y}" width="${Math.max(8, barWidth - 4)}" height="${barHeight}" fill="${color}" opacity="0.82"></rect>
-            <text class="axis-label" x="${x}" y="${height - 14}" transform="rotate(30 ${x} ${height - 14})">${bucket.lower_bps.toFixed(0)}</text>
+            <text class="axis-label" x="${x + Math.max(8, barWidth - 4) / 2}" y="${Math.max(14, y - 4)}" text-anchor="middle">${bucket.count}</text>
+            <text class="axis-label" x="${x}" y="${height - 14}" transform="rotate(30 ${x} ${height - 14})">${axisLabel}</text>
           `;
         })
         .join("")}
